@@ -40,6 +40,15 @@ public class ChunkIndicesWrapper {
         concatLongs(timesList));
   }
 
+  public void clear() {
+    chunks.clear();
+    timesIndexed.clear();
+  }
+
+  public int size() {
+    return chunks.size();
+  }
+
   private long[] concatLongs(List<long[]> arrays) {
     int totalLength = 0;
     for (long[] array : arrays) {

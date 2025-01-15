@@ -516,7 +516,7 @@ public class FragmentedMp4Extractor implements Extractor {
   }
 
   private void readRemainingSidxAtomsIntoTrack(ExtractorInput input) throws IOException {
-    atomHeaderBytesRead = 0;
+    enterReadingAtomHeaderState();
     while (readAtomHeader(input, true)) {
       if (atomType == Mp4Box.TYPE_sidx) {
         ParsableByteArray inputArray = new ParsableByteArray((int) atomSize);
@@ -529,11 +529,8 @@ public class FragmentedMp4Extractor implements Extractor {
       } else {
         input.skipFully((int) atomSize - atomHeaderBytesRead, true);
       }
-      atomHeaderBytesRead = 0;
+      enterReadingAtomHeaderState();
     }
-
-    haveResetCallerSeek = true;
-    extractorOutput.seekMap(wrappingSegmentIndex.toChunkIndex());
   }
 
   @Override
@@ -696,15 +693,18 @@ public class FragmentedMp4Extractor implements Extractor {
       containerAtoms.peek().add(leaf);
     } else if (leaf.type == Mp4Box.TYPE_sidx) {
       Pair<Long, ChunkIndex> result = parseSidx(leaf.data, inputPosition);
+      // TODO dedupe this.
+      wrappingSegmentIndex.merge(result.second);
       if (!haveOutputSeekMap) {
         segmentIndexEarliestPresentationTimeUs = result.first;
         extractorOutput.seekMap(result.second);
         haveOutputSeekMap = true;
-        wrappingSegmentIndex.merge(result.second);
-      } else if (!haveOutputSeekMapComplete) {
+      } else if (!haveOutputSeekMapComplete && wrappingSegmentIndex.size() > 1) {
         haveOutputSeekMapComplete = true;
-        wrappingSegmentIndex.merge(result.second);
+        haveResetCallerSeek = true;
         readRemainingSidxAtomsIntoTrack(input);
+        extractorOutput.seekMap(wrappingSegmentIndex.toChunkIndex());
+        wrappingSegmentIndex.clear(); // Clear to not store in memory now unneeded.
       }
     } else if (leaf.type == Mp4Box.TYPE_emsg) {
       onEmsgLeafAtomRead(leaf.data);

@@ -30,6 +30,8 @@
 *   Extractors:
     *   Fix handling of NAL units with lengths expressed in 1 or 2 bytes (rather
         than 4).
+    *   Fix seek on fragmented mp4 with multiple sidx atoms. 
+        ([#9373](https://github.com/google/ExoPlayer/issues/9373))
 *   DataSource:
 *   Audio:
     *   Do not bypass `SonicAudioProcessor` when `SpeedChangingAudioProcessor`
