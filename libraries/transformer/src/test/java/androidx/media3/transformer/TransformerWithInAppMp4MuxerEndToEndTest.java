@@ -34,7 +34,6 @@ import androidx.media3.container.Mp4TimestampData;
 import androidx.media3.container.XmpData;
 import androidx.media3.extractor.mp4.Mp4Extractor;
 import androidx.media3.extractor.text.DefaultSubtitleParserFactory;
-import androidx.media3.muxer.Muxer;
 import androidx.media3.test.utils.DumpFileAsserts;
 import androidx.media3.test.utils.FakeExtractorOutput;
 import androidx.test.core.app.ApplicationProvider;
@@ -47,9 +46,9 @@ import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
 import org.junit.runner.RunWith;
 
-/** End-to-end test for {@link Transformer} with {@link InAppMuxer}. */
+/** End-to-end test for {@link Transformer} with {@link InAppMp4Muxer}. */
 @RunWith(AndroidJUnit4.class)
-public class TransformerWithInAppMuxerEndToEndNonParameterizedTest {
+public class TransformerWithInAppMp4MuxerEndToEndTest {
   private static final String MP4_FILE_PATH = "asset:///media/mp4/sample_no_bframes.mp4";
 
   @Rule public final TemporaryFolder outputDir = new TemporaryFolder();
@@ -67,15 +66,13 @@ public class TransformerWithInAppMuxerEndToEndNonParameterizedTest {
     String tsFilePath = "asset:///media/ts/sample_h264.ts";
     String tsFileName = "ts/sample_h264.ts";
     Muxer.Factory inAppMuxerFactory =
-        new InAppMuxer.Factory.Builder()
-            .setMetadataProvider(
-                metadataEntries ->
-                    // Add timestamp to make output file deterministic.
-                    metadataEntries.add(
-                        new Mp4TimestampData(
-                            /* creationTimestampSeconds= */ 3_000_000_000L,
-                            /* modificationTimestampSeconds= */ 4_000_000_000L)))
-            .build();
+        new InAppMp4Muxer.Factory(
+            metadataEntries ->
+                // Add timestamp to make output file deterministic.
+                metadataEntries.add(
+                    new Mp4TimestampData(
+                        /* creationTimestampSeconds= */ 3_000_000_000L,
+                        /* modificationTimestampSeconds= */ 4_000_000_000L)));
 
     Transformer transformer =
         new TestTransformerBuilder(context).setMuxerFactory(inAppMuxerFactory).build();
@@ -104,14 +101,11 @@ public class TransformerWithInAppMuxerEndToEndNonParameterizedTest {
     Mp4LocationData expectedLocationData =
         new Mp4LocationData(/* latitude= */ 45f, /* longitude= */ -90f);
     Muxer.Factory inAppMuxerFactory =
-        new InAppMuxer.Factory.Builder()
-            .setMetadataProvider(
-                metadataEntries -> {
-                  metadataEntries.removeIf(
-                      (Metadata.Entry entry) -> entry instanceof Mp4LocationData);
-                  metadataEntries.add(expectedLocationData);
-                })
-            .build();
+        new InAppMp4Muxer.Factory(
+            metadataEntries -> {
+              metadataEntries.removeIf((Metadata.Entry entry) -> entry instanceof Mp4LocationData);
+              metadataEntries.add(expectedLocationData);
+            });
     Transformer transformer =
         new TestTransformerBuilder(context).setMuxerFactory(inAppMuxerFactory).build();
     MediaItem mediaItem = MediaItem.fromUri(Uri.parse(MP4_FILE_PATH));
@@ -130,9 +124,7 @@ public class TransformerWithInAppMuxerEndToEndNonParameterizedTest {
     String xmpSampleData = "media/xmp/sample_datetime_xmp.xmp";
     byte[] xmpData = androidx.media3.test.utils.TestUtil.getByteArray(context, xmpSampleData);
     Muxer.Factory inAppMuxerFactory =
-        new InAppMuxer.Factory.Builder()
-            .setMetadataProvider(metadataEntries -> metadataEntries.add(new XmpData(xmpData)))
-            .build();
+        new InAppMp4Muxer.Factory(metadataEntries -> metadataEntries.add(new XmpData(xmpData)));
     Transformer transformer =
         new TestTransformerBuilder(context).setMuxerFactory(inAppMuxerFactory).build();
     MediaItem mediaItem = MediaItem.fromUri(Uri.parse(MP4_FILE_PATH));
@@ -153,9 +145,7 @@ public class TransformerWithInAppMuxerEndToEndNonParameterizedTest {
             /* value= */ Util.toByteArray(captureFps),
             MdtaMetadataEntry.TYPE_INDICATOR_FLOAT32);
     Muxer.Factory inAppMuxerFactory =
-        new InAppMuxer.Factory.Builder()
-            .setMetadataProvider(metadataEntries -> metadataEntries.add(expectedCaptureFps))
-            .build();
+        new InAppMp4Muxer.Factory(metadataEntries -> metadataEntries.add(expectedCaptureFps));
     Transformer transformer =
         new TestTransformerBuilder(context).setMuxerFactory(inAppMuxerFactory).build();
     MediaItem mediaItem = MediaItem.fromUri(Uri.parse(MP4_FILE_PATH));
@@ -181,9 +171,7 @@ public class TransformerWithInAppMuxerEndToEndNonParameterizedTest {
             /* creationTimestampSeconds= */ 3_000_000_000L,
             /* modificationTimestampSeconds= */ 4_000_000_000L);
     Muxer.Factory inAppMuxerFactory =
-        new InAppMuxer.Factory.Builder()
-            .setMetadataProvider(metadataEntries -> metadataEntries.add(expectedTimestampData))
-            .build();
+        new InAppMp4Muxer.Factory(metadataEntries -> metadataEntries.add(expectedTimestampData));
 
     Transformer transformer =
         new TestTransformerBuilder(context).setMuxerFactory(inAppMuxerFactory).build();
@@ -212,13 +200,11 @@ public class TransformerWithInAppMuxerEndToEndNonParameterizedTest {
             /* value= */ Util.toByteArray(600.0f),
             MdtaMetadataEntry.TYPE_INDICATOR_FLOAT32);
     Muxer.Factory inAppMuxerFactory =
-        new InAppMuxer.Factory.Builder()
-            .setMetadataProvider(
-                metadataEntries -> {
-                  metadataEntries.add(expectedStringMetadata);
-                  metadataEntries.add(expectedFloatMetadata);
-                })
-            .build();
+        new InAppMp4Muxer.Factory(
+            metadataEntries -> {
+              metadataEntries.add(expectedStringMetadata);
+              metadataEntries.add(expectedFloatMetadata);
+            });
     Transformer transformer =
         new TestTransformerBuilder(context).setMuxerFactory(inAppMuxerFactory).build();
     MediaItem mediaItem = MediaItem.fromUri(Uri.parse(MP4_FILE_PATH));
@@ -248,7 +234,7 @@ public class TransformerWithInAppMuxerEndToEndNonParameterizedTest {
 
   @Test
   public void transmux_withSettingVideoDuration_writesCorrectVideoDuration() throws Exception {
-    InAppMuxer.Factory inAppMuxerFactory = new InAppMuxer.Factory.Builder().build();
+    InAppMp4Muxer.Factory inAppMuxerFactory = new InAppMp4Muxer.Factory();
     long expectedDurationUs = 2_000_000L;
     inAppMuxerFactory.setVideoDurationUs(expectedDurationUs);
     Transformer transformer =

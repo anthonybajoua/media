@@ -16,6 +16,13 @@
         items during playback to reduce media item transition latency.
     *   Fix issue where additional decode-only frames may be displayed in quick
         succession when transitioning to content media after a mid-roll ad.
+    *   Make `DefaultRenderersFactory` add two `MetadataRenderer` instances by
+        default to enable apps to receive two different schemes of metadata by
+        default.
+    *   Initialize `DeviceInfo` and device volume asynchronously (if enabled via
+        `setDeviceVolumeControlEnabled`). These values won't be available
+        instantly after the `ExoPlayer.Builder.build()` and are notified via
+        `Player.Listener.onDeviceInfoChanged` and `onDeviceVolumeChanged`.
 *   Transformer:
     *   Enable support for Android platform diagnostics via
         `MediaMetricsManager`. Transformer will forward editing events and
@@ -26,6 +33,11 @@
         by the user of the device. Apps can opt-out of contributing to platform
         diagnostics for Transformer with
         `Transformer.Builder.setUsePlatformDiagnostics(false)`.
+    *   Split `InAppMuxer` into `InAppMp4Muxer` and `InAppFragmentedMp4Muxer`.
+        `InAppMp4Muxer` is to be used for producing a non-fragmented MP4 file,
+        while `InAppFragmentedMp4Muxer` is to be used for producing a fragmented
+        MP4 file.
+    *   Move `Muxer` interface from `media3-muxer` to `media3-transformer`.
 *   Track Selection:
 *   Extractors:
     *   Fix handling of NAL units with lengths expressed in 1 or 2 bytes (rather
@@ -51,6 +63,8 @@
         ([#1997](https://github.com/androidx/media/issues/1997)).
     *   Add support for VobSub subtitles
         ([#8260](https://github.com/google/ExoPlayer/issues/8260)).
+    *   Fix playback hanging when a playlist contains clipped items with CEA-608
+        or CEA-708 captions.
 *   Metadata:
 *   Image:
 *   DataSource:
@@ -61,6 +75,8 @@
         in both `Mp4Muxer.Builder` and `FragmentedMp4Muxer.Builder`.
     *   `Mp4Muxer.addTrack()` and `FragmentedMp4Muxer.addTrack()` now return an
         `int` track id instead of a `TrackToken`.
+    *   `Mp4Muxer` and `FragmentedMp4Muxer` no longer implement `Muxer`
+        interface.
 *   IMA extension:
 *   Session:
     *   Fix bug where calling a `Player` method on a `MediaController` connected
@@ -98,6 +114,8 @@
         Composable depending on the ContentScale type and cover it with a
         shutter-overlay before the first frame is rendered.
 *   Remove deprecated symbols:
+    *   Removed `ExoPlayer.VideoComponent`, `ExoPlayer.AudioComponent`,
+        `ExoPlayer.TextComponent` and `ExoPlayer.DeviceComponent`.
 
 ## 1.6
 

@@ -119,19 +119,13 @@ import androidx.media3.exoplayer.video.VideoRendererEventListener;
 import androidx.media3.exoplayer.video.spherical.CameraMotionListener;
 import androidx.media3.exoplayer.video.spherical.SphericalGLSurfaceView;
 import com.google.common.collect.ImmutableList;
-import com.google.errorprone.annotations.CanIgnoreReturnValue;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArraySet;
 
 /** The default implementation of {@link ExoPlayer}. */
-/* package */ final class ExoPlayerImpl extends BasePlayer
-    implements ExoPlayer,
-        ExoPlayer.AudioComponent,
-        ExoPlayer.VideoComponent,
-        ExoPlayer.TextComponent,
-        ExoPlayer.DeviceComponent {
+/* package */ final class ExoPlayerImpl extends BasePlayer implements ExoPlayer {
 
   static {
     MediaLibraryInfo.registerModule("media3.exoplayer");
@@ -388,6 +382,7 @@ import java.util.concurrent.CopyOnWriteArraySet;
               playerId,
               builder.playbackLooperProvider,
               preloadConfiguration);
+      Looper playbackLooper = internalPlayer.getPlaybackLooper();
 
       volume = 1;
       repeatMode = Player.REPEAT_MODE_OFF;
@@ -426,15 +421,20 @@ import java.util.concurrent.CopyOnWriteArraySet;
       if (builder.deviceVolumeControlEnabled) {
         streamVolumeManager =
             new StreamVolumeManager(
-                builder.context, eventHandler, componentListener, audioAttributes.getStreamType());
+                builder.context,
+                componentListener,
+                audioAttributes.getStreamType(),
+                playbackLooper,
+                applicationLooper,
+                clock);
       } else {
         streamVolumeManager = null;
       }
-      wakeLockManager = new WakeLockManager(builder.context);
+      wakeLockManager = new WakeLockManager(builder.context, playbackLooper, clock);
       wakeLockManager.setEnabled(builder.wakeMode != C.WAKE_MODE_NONE);
-      wifiLockManager = new WifiLockManager(builder.context);
+      wifiLockManager = new WifiLockManager(builder.context, playbackLooper, clock);
       wifiLockManager.setEnabled(builder.wakeMode == C.WAKE_MODE_NETWORK);
-      deviceInfo = createDeviceInfo(streamVolumeManager);
+      deviceInfo = DeviceInfo.UNKNOWN;
       videoSize = VideoSize.UNKNOWN;
       surfaceSize = Size.UNKNOWN;
 
@@ -454,42 +454,6 @@ import java.util.concurrent.CopyOnWriteArraySet;
     } finally {
       constructorFinished.open();
     }
-  }
-
-  @CanIgnoreReturnValue
-  @SuppressWarnings("deprecation") // Returning deprecated class.
-  @Override
-  @Deprecated
-  public AudioComponent getAudioComponent() {
-    verifyApplicationThread();
-    return this;
-  }
-
-  @CanIgnoreReturnValue
-  @SuppressWarnings("deprecation") // Returning deprecated class.
-  @Override
-  @Deprecated
-  public VideoComponent getVideoComponent() {
-    verifyApplicationThread();
-    return this;
-  }
-
-  @CanIgnoreReturnValue
-  @SuppressWarnings("deprecation") // Returning deprecated class.
-  @Override
-  @Deprecated
-  public TextComponent getTextComponent() {
-    verifyApplicationThread();
-    return this;
-  }
-
-  @CanIgnoreReturnValue
-  @SuppressWarnings("deprecation") // Returning deprecated class.
-  @Override
-  @Deprecated
-  public DeviceComponent getDeviceComponent() {
-    verifyApplicationThread();
-    return this;
   }
 
   @Override

@@ -15,8 +15,6 @@
  */
 package androidx.media3.transformer;
 
-import static androidx.media3.muxer.Mp4Muxer.LAST_SAMPLE_DURATION_BEHAVIOR_SET_FROM_END_OF_STREAM_BUFFER_OR_DUPLICATE_PREVIOUS;
-
 import android.media.MediaCodec;
 import android.media.MediaCodec.BufferInfo;
 import androidx.annotation.Nullable;
@@ -27,9 +25,7 @@ import androidx.media3.common.MimeTypes;
 import androidx.media3.common.util.Log;
 import androidx.media3.common.util.UnstableApi;
 import androidx.media3.container.Mp4OrientationData;
-import androidx.media3.muxer.FragmentedMp4Muxer;
 import androidx.media3.muxer.Mp4Muxer;
-import androidx.media3.muxer.Muxer;
 import androidx.media3.muxer.MuxerException;
 import androidx.media3.muxer.MuxerUtil;
 import com.google.common.collect.ImmutableList;
@@ -41,10 +37,9 @@ import java.util.LinkedHashSet;
 import java.util.Locale;
 import java.util.Set;
 
-/** {@link Muxer} implementation that uses an {@link Mp4Muxer} or {@link FragmentedMp4Muxer}. */
+/** {@link Muxer} implementation that uses an {@link Mp4Muxer}. */
 @UnstableApi
-public final class InAppMuxer implements Muxer {
-
+public final class InAppMp4Muxer implements Muxer {
   /** Provides {@linkplain Metadata.Entry metadata} to add in the output MP4 file. */
   public interface MetadataProvider {
 
@@ -60,88 +55,24 @@ public final class InAppMuxer implements Muxer {
     void updateMetadataEntries(Set<Metadata.Entry> metadataEntries);
   }
 
-  /** {@link Muxer.Factory} for {@link InAppMuxer}. */
+  /** {@link Muxer.Factory} for {@link InAppMp4Muxer}. */
   public static final class Factory implements Muxer.Factory {
-
-    /** A builder for {@link Factory} instances. */
-    public static final class Builder {
-      @Nullable private MetadataProvider metadataProvider;
-      private boolean outputFragmentedMp4;
-      private long fragmentDurationMs;
-
-      /** Creates a {@link Builder} instance with default values. */
-      public Builder() {
-        fragmentDurationMs = C.TIME_UNSET;
-      }
-
-      /**
-       * Sets an implementation of {@link MetadataProvider}.
-       *
-       * <p>The default value is {@code null}.
-       *
-       * <p>If the value is not set then the {@linkplain Metadata.Entry metadata} from the input
-       * file is set as it is in the output file.
-       */
-      @CanIgnoreReturnValue
-      public Builder setMetadataProvider(MetadataProvider metadataProvider) {
-        this.metadataProvider = metadataProvider;
-        return this;
-      }
-
-      /** Sets whether to output a fragmented MP4. */
-      @CanIgnoreReturnValue
-      public Builder setOutputFragmentedMp4(boolean outputFragmentedMp4) {
-        this.outputFragmentedMp4 = outputFragmentedMp4;
-        return this;
-      }
-
-      /**
-       * Sets the fragment duration (in milliseconds) if the output file is {@link
-       * #setOutputFragmentedMp4(boolean) fragmented}.
-       */
-      @CanIgnoreReturnValue
-      public Builder setFragmentDurationMs(long fragmentDurationMs) {
-        this.fragmentDurationMs = fragmentDurationMs;
-        return this;
-      }
-
-      /** Builds a {@link Factory} instance. */
-      public Factory build() {
-        return new Factory(metadataProvider, outputFragmentedMp4, fragmentDurationMs);
-      }
-    }
-
-    /** A list of supported video sample MIME types. */
-    private static final ImmutableList<String> SUPPORTED_VIDEO_SAMPLE_MIME_TYPES =
-        ImmutableList.of(
-            MimeTypes.VIDEO_AV1,
-            MimeTypes.VIDEO_H263,
-            MimeTypes.VIDEO_H264,
-            MimeTypes.VIDEO_H265,
-            MimeTypes.VIDEO_MP4V);
-
-    /** A list of supported audio sample MIME types. */
-    private static final ImmutableList<String> SUPPORTED_AUDIO_SAMPLE_MIME_TYPES =
-        ImmutableList.of(
-            MimeTypes.AUDIO_AAC,
-            MimeTypes.AUDIO_AMR_NB,
-            MimeTypes.AUDIO_AMR_WB,
-            MimeTypes.AUDIO_OPUS,
-            MimeTypes.AUDIO_VORBIS);
-
     @Nullable private final MetadataProvider metadataProvider;
-    private final boolean outputFragmentedMp4;
-    private final long fragmentDurationMs;
 
     private long videoDurationUs;
 
-    private Factory(
-        @Nullable MetadataProvider metadataProvider,
-        boolean outputFragmentedMp4,
-        long fragmentDurationMs) {
+    /** Creates an instance with default values. */
+    public Factory() {
+      this(/* metadataProvider= */ null);
+    }
+
+    /**
+     * Creates an instance.
+     *
+     * @param metadataProvider A {@link MetadataProvider}.
+     */
+    public Factory(@Nullable MetadataProvider metadataProvider) {
       this.metadataProvider = metadataProvider;
-      this.outputFragmentedMp4 = outputFragmentedMp4;
-      this.fragmentDurationMs = fragmentDurationMs;
       videoDurationUs = C.TIME_UNSET;
     }
 
@@ -167,7 +98,7 @@ public final class InAppMuxer implements Muxer {
     }
 
     @Override
-    public InAppMuxer create(String path) throws MuxerException {
+    public InAppMp4Muxer create(String path) throws MuxerException {
       FileOutputStream outputStream;
       try {
         outputStream = new FileOutputStream(path);
@@ -175,48 +106,35 @@ public final class InAppMuxer implements Muxer {
         throw new MuxerException("Error creating file output stream", e);
       }
 
-      Muxer muxer = null;
-      if (outputFragmentedMp4) {
-        FragmentedMp4Muxer.Builder builder = new FragmentedMp4Muxer.Builder(outputStream);
-        if (fragmentDurationMs != C.TIME_UNSET) {
-          builder.setFragmentDurationMs(fragmentDurationMs);
-        }
-        muxer = builder.build();
-      } else {
-        Mp4Muxer.Builder builder = new Mp4Muxer.Builder(outputStream);
-        if (videoDurationUs != C.TIME_UNSET) {
-          builder.setLastSampleDurationBehavior(
-              LAST_SAMPLE_DURATION_BEHAVIOR_SET_FROM_END_OF_STREAM_BUFFER_OR_DUPLICATE_PREVIOUS);
-        }
-        muxer = builder.build();
-      }
+      Mp4Muxer.Builder builder = new Mp4Muxer.Builder(outputStream);
+      Mp4Muxer muxer = builder.build();
 
-      return new InAppMuxer(muxer, metadataProvider, videoDurationUs);
+      return new InAppMp4Muxer(muxer, metadataProvider, videoDurationUs);
     }
 
     @Override
     public ImmutableList<String> getSupportedSampleMimeTypes(@C.TrackType int trackType) {
       if (trackType == C.TRACK_TYPE_VIDEO) {
-        return SUPPORTED_VIDEO_SAMPLE_MIME_TYPES;
+        return Mp4Muxer.SUPPORTED_VIDEO_SAMPLE_MIME_TYPES;
       } else if (trackType == C.TRACK_TYPE_AUDIO) {
-        return SUPPORTED_AUDIO_SAMPLE_MIME_TYPES;
+        return Mp4Muxer.SUPPORTED_AUDIO_SAMPLE_MIME_TYPES;
       }
       return ImmutableList.of();
     }
   }
 
-  private static final String TAG = "InAppMuxer";
+  private static final String TAG = "InAppMp4Muxer";
   private static final int TRACK_ID_UNSET = -1;
 
-  private final Muxer muxer;
+  private final Mp4Muxer muxer;
   @Nullable private final MetadataProvider metadataProvider;
   private final long videoDurationUs;
   private final Set<Metadata.Entry> metadataEntries;
 
   private int videoTrackId;
 
-  private InAppMuxer(
-      Muxer muxer, @Nullable MetadataProvider metadataProvider, long videoDurationUs) {
+  private InAppMp4Muxer(
+      Mp4Muxer muxer, @Nullable MetadataProvider metadataProvider, long videoDurationUs) {
     this.muxer = muxer;
     this.metadataProvider = metadataProvider;
     this.videoDurationUs = videoDurationUs;

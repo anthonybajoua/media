@@ -34,6 +34,7 @@ import androidx.annotation.Nullable;
 import androidx.media3.common.C;
 import androidx.media3.common.Format;
 import androidx.media3.common.Metadata;
+import androidx.media3.common.MimeTypes;
 import androidx.media3.common.util.Log;
 import androidx.media3.common.util.UnstableApi;
 import androidx.media3.container.MdtaMetadataEntry;
@@ -41,6 +42,7 @@ import androidx.media3.container.Mp4LocationData;
 import androidx.media3.container.Mp4OrientationData;
 import androidx.media3.container.Mp4TimestampData;
 import androidx.media3.container.XmpData;
+import com.google.common.collect.ImmutableList;
 import com.google.common.io.ByteStreams;
 import com.google.errorprone.annotations.CanIgnoreReturnValue;
 import java.io.FileInputStream;
@@ -107,7 +109,7 @@ import org.checkerframework.checker.nullness.qual.EnsuresNonNull;
  * </ul>
  */
 @UnstableApi
-public final class Mp4Muxer implements Muxer {
+public final class Mp4Muxer implements AutoCloseable {
   /** Parameters for {@link #FILE_FORMAT_MP4_WITH_AUXILIARY_TRACKS_EXTENSION}. */
   public static final class Mp4AtFileParameters {
     /** Provides temporary cache files to be used by the muxer. */
@@ -335,6 +337,24 @@ public final class Mp4Muxer implements Muxer {
     }
   }
 
+  /** A list of supported video {@linkplain MimeTypes sample MIME types}. */
+  public static final ImmutableList<String> SUPPORTED_VIDEO_SAMPLE_MIME_TYPES =
+      ImmutableList.of(
+          MimeTypes.VIDEO_AV1,
+          MimeTypes.VIDEO_H263,
+          MimeTypes.VIDEO_H264,
+          MimeTypes.VIDEO_H265,
+          MimeTypes.VIDEO_MP4V);
+
+  /** A list of supported audio {@linkplain MimeTypes sample MIME types}. */
+  public static final ImmutableList<String> SUPPORTED_AUDIO_SAMPLE_MIME_TYPES =
+      ImmutableList.of(
+          MimeTypes.AUDIO_AAC,
+          MimeTypes.AUDIO_AMR_NB,
+          MimeTypes.AUDIO_AMR_WB,
+          MimeTypes.AUDIO_OPUS,
+          MimeTypes.AUDIO_VORBIS);
+
   private static final String TAG = "Mp4Muxer";
 
   private final FileOutputStream outputStream;
@@ -391,7 +411,7 @@ public final class Mp4Muxer implements Muxer {
   }
 
   /**
-   * {@inheritDoc}
+   * Adds a track of the given media format.
    *
    * <p>Tracks can be added at any point before the muxer is closed, even after writing samples to
    * other tracks.
@@ -403,7 +423,6 @@ public final class Mp4Muxer implements Muxer {
    *     #writeSampleData}.
    * @throws MuxerException If an error occurs while adding track.
    */
-  @Override
   public int addTrack(Format format) throws MuxerException {
     return addTrack(/* sortKey= */ 1, format);
   }
@@ -449,7 +468,7 @@ public final class Mp4Muxer implements Muxer {
   }
 
   /**
-   * {@inheritDoc}
+   * Writes encoded sample data.
    *
    * <p>When sample batching is {@linkplain Mp4Muxer.Builder#setSampleBatchingEnabled(boolean)
    * enabled}, provide sample data ({@link ByteBuffer}, {@link BufferInfo}) that won't be modified
@@ -466,7 +485,6 @@ public final class Mp4Muxer implements Muxer {
    * @param bufferInfo The {@link BufferInfo} related to this sample.
    * @throws MuxerException If an error occurs while writing data to the output file.
    */
-  @Override
   public void writeSampleData(int trackId, ByteBuffer byteBuffer, BufferInfo bufferInfo)
       throws MuxerException {
     Track track = trackIdToTrack.get(trackId);
@@ -487,7 +505,7 @@ public final class Mp4Muxer implements Muxer {
   }
 
   /**
-   * {@inheritDoc}
+   * Adds {@linkplain Metadata.Entry metadata} about the output file.
    *
    * <p>List of supported {@linkplain Metadata.Entry metadata entries}:
    *
@@ -505,12 +523,18 @@ public final class Mp4Muxer implements Muxer {
    *     IllegalArgumentException} is thrown if the {@linkplain Metadata.Entry metadata} is not
    *     supported.
    */
-  @Override
   public void addMetadataEntry(Metadata.Entry metadataEntry) {
     checkArgument(isMetadataSupported(metadataEntry), "Unsupported metadata");
     metadataCollector.addMetadata(metadataEntry);
   }
 
+  /**
+   * Closes the file.
+   *
+   * <p>The muxer cannot be used anymore once this method returns.
+   *
+   * @throws MuxerException If the muxer fails to finish writing the output.
+   */
   @Override
   public void close() throws MuxerException {
     @Nullable MuxerException exception = null;
