@@ -39,6 +39,7 @@ import android.media.MediaCrypto;
 import android.media.MediaCryptoException;
 import android.media.MediaFormat;
 import android.media.metrics.LogSessionId;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.SystemClock;
 import androidx.annotation.CallSuper;
@@ -496,9 +497,9 @@ public abstract class MediaCodecRenderer extends BaseRenderer {
   @Override
   public final long getDurationToProgressUs(long positionUs, long elapsedRealtimeUs) {
     return getDurationToProgressUs(
-        /* isOnBufferAvailableListenerRegistered= */ codecRegisteredOnBufferAvailableListener,
         positionUs,
-        elapsedRealtimeUs);
+        elapsedRealtimeUs,
+        /* isOnBufferAvailableListenerRegistered= */ codecRegisteredOnBufferAvailableListener);
   }
 
   /**
@@ -520,17 +521,17 @@ public abstract class MediaCodecRenderer extends BaseRenderer {
    * decoder input and output buffers become available. These callbacks may affect the calculated
    * minimum time playback must advance before a {@link #render} call can make progress.
    *
-   * @param isOnBufferAvailableListenerRegistered Whether the {@code Renderer} is using a {@link
-   *     MediaCodecAdapter} with successfully registered {@link
-   *     MediaCodecAdapter.OnBufferAvailableListener OnBufferAvailableListener}.
    * @param positionUs The current media time in microseconds, measured at the start of the current
    *     iteration of the rendering loop.
    * @param elapsedRealtimeUs {@link android.os.SystemClock#elapsedRealtime()} in microseconds,
    *     measured at the start of the current iteration of the rendering loop.
+   * @param isOnBufferAvailableListenerRegistered Whether the {@code Renderer} is using a {@link
+   *     MediaCodecAdapter} with successfully registered {@link
+   *     MediaCodecAdapter.OnBufferAvailableListener OnBufferAvailableListener}.
    * @return minimum time playback must advance before renderer is able to make progress.
    */
   protected long getDurationToProgressUs(
-      boolean isOnBufferAvailableListenerRegistered, long positionUs, long elapsedRealtimeUs) {
+      long positionUs, long elapsedRealtimeUs, boolean isOnBufferAvailableListenerRegistered) {
     return super.getDurationToProgressUs(positionUs, elapsedRealtimeUs);
   }
 
@@ -1433,9 +1434,7 @@ public abstract class MediaCodecRenderer extends BaseRenderer {
       return true;
     }
 
-    if (shouldSkipDecoderInputBuffer(buffer)) {
-      buffer.clear();
-      decoderCounters.skippedInputBufferCount += 1;
+    if (shouldDiscardDecoderInputBuffer(buffer)) {
       return true;
     }
 
@@ -1749,6 +1748,33 @@ public abstract class MediaCodecRenderer extends BaseRenderer {
    * @param buffer The input buffer.
    */
   protected boolean shouldSkipDecoderInputBuffer(DecoderInputBuffer buffer) {
+    return false;
+  }
+
+  /**
+   * Returns whether the input buffer should be discarded before decoding.
+   *
+   * <p>Implement this method to to skip decoding of buffers that are not needed during a seek, or
+   * to drop input buffers that cannot be rendered on time. See {@link
+   * C#BUFFER_FLAG_NOT_DEPENDED_ON}.
+   *
+   * <p>Subclasses that implement this method are responsible for updating {@link #decoderCounters}.
+   * For codecs with out-of-order buffers, consecutive dropped input buffers may have to be counted
+   * after frame reordering. For example, in {@link #processOutputBuffer}.
+   *
+   * <p>Implementations of this method must update the {@linkplain DecoderInputBuffer#data decoder
+   * input buffer contents}. Data that is only used for output at the current {@link
+   * DecoderInputBuffer#timeUs} should be removed. Data that is referenced by later input buffers
+   * should remain in the current buffer.
+   *
+   * @param buffer The input buffer.
+   */
+  protected boolean shouldDiscardDecoderInputBuffer(DecoderInputBuffer buffer) {
+    if (shouldSkipDecoderInputBuffer(buffer)) {
+      buffer.clear();
+      decoderCounters.skippedInputBufferCount += 1;
+      return true;
+    }
     return false;
   }
 
@@ -2560,17 +2586,17 @@ public abstract class MediaCodecRenderer extends BaseRenderer {
   private @AdaptationWorkaroundMode int codecAdaptationWorkaroundMode(String name) {
     if (Util.SDK_INT <= 25
         && "OMX.Exynos.avc.dec.secure".equals(name)
-        && (Util.MODEL.startsWith("SM-T585")
-            || Util.MODEL.startsWith("SM-A510")
-            || Util.MODEL.startsWith("SM-A520")
-            || Util.MODEL.startsWith("SM-J700"))) {
+        && (Build.MODEL.startsWith("SM-T585")
+            || Build.MODEL.startsWith("SM-A510")
+            || Build.MODEL.startsWith("SM-A520")
+            || Build.MODEL.startsWith("SM-J700"))) {
       return ADAPTATION_WORKAROUND_MODE_ALWAYS;
     } else if (Util.SDK_INT < 24
         && ("OMX.Nvidia.h264.decode".equals(name) || "OMX.Nvidia.h264.decode.secure".equals(name))
-        && ("flounder".equals(Util.DEVICE)
-            || "flounder_lte".equals(Util.DEVICE)
-            || "grouper".equals(Util.DEVICE)
-            || "tilapia".equals(Util.DEVICE))) {
+        && ("flounder".equals(Build.DEVICE)
+            || "flounder_lte".equals(Build.DEVICE)
+            || "grouper".equals(Build.DEVICE)
+            || "tilapia".equals(Build.DEVICE))) {
       return ADAPTATION_WORKAROUND_MODE_SAME_RESOLUTION;
     } else {
       return ADAPTATION_WORKAROUND_MODE_NEVER;
@@ -2616,7 +2642,7 @@ public abstract class MediaCodecRenderer extends BaseRenderer {
                 || "OMX.bcm.vdec.avc.tunnel.secure".equals(name)
                 || "OMX.bcm.vdec.hevc.tunnel".equals(name)
                 || "OMX.bcm.vdec.hevc.tunnel.secure".equals(name)))
-        || ("Amazon".equals(Util.MANUFACTURER) && "AFTS".equals(Util.MODEL) && codecInfo.secure);
+        || ("Amazon".equals(Build.MANUFACTURER) && "AFTS".equals(Build.MODEL) && codecInfo.secure);
   }
 
   /**

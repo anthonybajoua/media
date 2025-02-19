@@ -98,7 +98,8 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
   private boolean decodeVideo;
   private int sequenceLoopCount;
   private int processedInputsSize;
-  private @MonotonicNonNull Format currentInputFormat;
+  private @MonotonicNonNull Format currentAudioInputFormat;
+  private @MonotonicNonNull Format currentVideoInputFormat;
 
   // Accessed when switching asset loader.
   private volatile boolean released;
@@ -195,7 +196,8 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
           new ExportResult.ProcessedInput(
               mediaItem,
               currentAssetDurationUs,
-              currentInputFormat,
+              currentAudioInputFormat,
+              currentVideoInputFormat,
               decoders.get(C.TRACK_TYPE_AUDIO),
               decoders.get(C.TRACK_TYPE_VIDEO)));
       processedInputsSize++;
@@ -234,7 +236,12 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
         isAudio ? "audio" : "video",
         inputFormat);
 
-    currentInputFormat = inputFormat;
+    if (isAudio) {
+      currentAudioInputFormat = inputFormat;
+    } else {
+      currentVideoInputFormat = inputFormat;
+    }
+
     if (!isCurrentAssetFirstAsset) {
       boolean decode = isAudio ? decodeAudio : decodeVideo;
       if (decode) {
@@ -307,7 +314,7 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
             new SampleConsumerWrapper(wrappedAudioSampleConsumer, C.TRACK_TYPE_AUDIO));
       }
     } else {
-      // TODO(b/270533049): Remove the check below when implementing blank video frames generation.
+      // TODO: b/270533049 - Remove the check below when implementing blank video frames generation.
       boolean videoTrackDisappeared =
           reportedTrackCount.get() == 1
               && trackType == C.TRACK_TYPE_AUDIO
@@ -355,7 +362,7 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
             ? C.TIME_UNSET
             : currentAssetDurationUs,
         /* decodedFormat= */ editedMediaItem.isGap() ? null : outputFormat,
-        /* isLast= */ currentMediaItemIndex == editedMediaItems.size() - 1);
+        /* isLast= */ isLastMediaItemInSequence());
   }
 
   // Methods called from any thread.
@@ -381,7 +388,7 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
   @Override
   public void onDurationUs(long durationUs) {
     checkArgument(
-        durationUs != C.TIME_UNSET || currentMediaItemIndex == editedMediaItems.size() - 1,
+        durationUs != C.TIME_UNSET || isLastMediaItemInSequence(),
         "Could not retrieve required duration for EditedMediaItem " + currentMediaItemIndex);
     currentAssetDurationAfterEffectsAppliedUs =
         editedMediaItems.get(currentMediaItemIndex).getDurationAfterEffectsApplied(durationUs);
@@ -400,6 +407,10 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
   @Override
   public void onError(ExportException exportException) {
     sequenceAssetLoaderListener.onError(exportException);
+  }
+
+  private boolean isLastMediaItemInSequence() {
+    return currentMediaItemIndex == editedMediaItems.size() - 1;
   }
 
   // Classes accessed from AssetLoader threads.
@@ -443,7 +454,7 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
 
       if (inputBuffer.isEndOfStream()) {
         nonEndedTrackCount.decrementAndGet();
-        if (currentMediaItemIndex < editedMediaItems.size() - 1 || isLooping) {
+        if (!isLastMediaItemInSequence() || isLooping) {
           if (trackType == C.TRACK_TYPE_AUDIO && !isLooping && decodeAudio) {
             // Trigger silence generation (if needed) for a decoded audio track when end of stream
             // is first encountered. This helps us avoid a muxer deadlock when audio track is
@@ -544,8 +555,7 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
     @Override
     public void signalEndOfVideoInput() {
       nonEndedTrackCount.decrementAndGet();
-      boolean videoEnded =
-          isLooping ? videoLoopingEnded : currentMediaItemIndex == editedMediaItems.size() - 1;
+      boolean videoEnded = isLooping ? videoLoopingEnded : isLastMediaItemInSequence();
       if (videoEnded) {
         sampleConsumer.signalEndOfVideoInput();
       } else if (nonEndedTrackCount.get() == 0) {
@@ -555,7 +565,7 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
 
     private void onGapSignalled() {
       nonEndedTrackCount.decrementAndGet();
-      if (currentMediaItemIndex < editedMediaItems.size() - 1) {
+      if (!isLastMediaItemInSequence()) {
         switchAssetLoader();
       }
     }

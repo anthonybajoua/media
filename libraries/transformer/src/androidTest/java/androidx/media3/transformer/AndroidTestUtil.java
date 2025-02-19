@@ -34,15 +34,18 @@ import android.content.Context;
 import android.graphics.Bitmap;
 import android.graphics.Bitmap.Config;
 import android.media.Image;
+import android.media.MediaCodec;
 import android.media.MediaCodecInfo;
 import android.opengl.EGLContext;
 import android.opengl.EGLDisplay;
+import android.os.Build;
 import androidx.annotation.Nullable;
 import androidx.media3.common.C;
 import androidx.media3.common.ColorInfo;
 import androidx.media3.common.Format;
 import androidx.media3.common.GlObjectsProvider;
 import androidx.media3.common.GlTextureInfo;
+import androidx.media3.common.Metadata;
 import androidx.media3.common.MimeTypes;
 import androidx.media3.common.util.GlRect;
 import androidx.media3.common.util.GlUtil;
@@ -57,6 +60,7 @@ import androidx.media3.effect.PassthroughShaderProgram;
 import androidx.media3.effect.ScaleAndRotateTransformation;
 import androidx.media3.exoplayer.mediacodec.MediaCodecSelector;
 import androidx.media3.exoplayer.mediacodec.MediaCodecUtil;
+import androidx.media3.muxer.MuxerException;
 import androidx.media3.test.utils.BitmapPixelTestUtil;
 import androidx.media3.test.utils.VideoDecodingWrapper;
 import com.google.common.base.Ascii;
@@ -66,6 +70,7 @@ import com.google.errorprone.annotations.CanIgnoreReturnValue;
 import java.io.File;
 import java.io.FileWriter;
 import java.io.IOException;
+import java.nio.ByteBuffer;
 import java.util.List;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -381,6 +386,28 @@ public final class AndroidTestUtil {
                   .setHeight(1080)
                   .setFrameRate(29.97f)
                   .setCodecs("avc1.64001F")
+                  .build())
+          .build();
+
+  public static final AssetInfo MP4_ASSET_H264_1080P_10SEC_VIDEO =
+      new AssetInfo.Builder("asset:///media/mp4/h264_1080p_30fps_10sec.mp4")
+          .setVideoFormat(
+              new Format.Builder()
+                  .setSampleMimeType(VIDEO_H264)
+                  .setWidth(1080)
+                  .setHeight(720)
+                  .setFrameRate(30.0f)
+                  .build())
+          .build();
+
+  public static final AssetInfo MP4_ASSET_H264_4K_10SEC_VIDEO =
+      new AssetInfo.Builder("asset:///media/mp4/h264_4k_30fps_10sec.mp4")
+          .setVideoFormat(
+              new Format.Builder()
+                  .setSampleMimeType(VIDEO_H264)
+                  .setWidth(3840)
+                  .setHeight(2160)
+                  .setFrameRate(30.0f)
                   .build())
           .build();
 
@@ -1121,7 +1148,7 @@ public final class AndroidTestUtil {
       throws IOException, InterruptedException {
     // b/298599172 - runUntilComparisonFrameOrEnded fails on this device because reading decoder
     //  output as a bitmap doesn't work.
-    assumeFalse(Util.SDK_INT == 21 && Ascii.toLowerCase(Util.MODEL).contains("nexus"));
+    assumeFalse(Util.SDK_INT == 21 && Ascii.toLowerCase(Build.MODEL).contains("nexus"));
     ImmutableList.Builder<Bitmap> bitmaps = new ImmutableList.Builder<>();
     try (VideoDecodingWrapper decodingWrapper =
         new VideoDecodingWrapper(
@@ -1198,6 +1225,87 @@ public final class AndroidTestUtil {
     }
   }
 
+  /** A {@link Muxer.Factory} that creates {@link FrameBlockingMuxer} instances. */
+  public static final class FrameBlockingMuxerFactory implements Muxer.Factory {
+    private final Muxer.Factory wrappedMuxerFactory;
+    private final FrameBlockingMuxer.Listener listener;
+    private final long presentationTimeUsToBlockFrame;
+
+    FrameBlockingMuxerFactory(
+        long presentationTimeUsToBlockFrame, FrameBlockingMuxer.Listener listener) {
+      this.wrappedMuxerFactory = new DefaultMuxer.Factory();
+      this.listener = listener;
+      this.presentationTimeUsToBlockFrame = presentationTimeUsToBlockFrame;
+    }
+
+    @Override
+    public Muxer create(String path) throws MuxerException {
+      return new FrameBlockingMuxer(
+          wrappedMuxerFactory.create(path), presentationTimeUsToBlockFrame, listener);
+    }
+
+    @Override
+    public ImmutableList<String> getSupportedSampleMimeTypes(@C.TrackType int trackType) {
+      return wrappedMuxerFactory.getSupportedSampleMimeTypes(trackType);
+    }
+  }
+
+  /** A {@link Muxer} that blocks writing video frames after a specific presentation timestamp. */
+  public static final class FrameBlockingMuxer implements Muxer {
+    interface Listener {
+      void onFrameBlocked();
+    }
+
+    private final Muxer wrappedMuxer;
+    private final FrameBlockingMuxer.Listener listener;
+    private final long presentationTimeUsToBlockFrame;
+
+    private boolean notifiedListener;
+    private int videoTrackId;
+
+    private FrameBlockingMuxer(
+        Muxer wrappedMuxer,
+        long presentationTimeUsToBlockFrame,
+        FrameBlockingMuxer.Listener listener) {
+      this.wrappedMuxer = wrappedMuxer;
+      this.listener = listener;
+      this.presentationTimeUsToBlockFrame = presentationTimeUsToBlockFrame;
+    }
+
+    @Override
+    public int addTrack(Format format) throws MuxerException {
+      int trackId = wrappedMuxer.addTrack(format);
+      if (MimeTypes.isVideo(format.sampleMimeType)) {
+        videoTrackId = trackId;
+      }
+      return trackId;
+    }
+
+    @Override
+    public void writeSampleData(int trackId, ByteBuffer data, MediaCodec.BufferInfo bufferInfo)
+        throws MuxerException {
+      if (trackId == videoTrackId
+          && bufferInfo.presentationTimeUs >= presentationTimeUsToBlockFrame) {
+        if (!notifiedListener) {
+          listener.onFrameBlocked();
+          notifiedListener = true;
+        }
+        return;
+      }
+      wrappedMuxer.writeSampleData(trackId, data, bufferInfo);
+    }
+
+    @Override
+    public void addMetadataEntry(Metadata.Entry metadataEntry) {
+      wrappedMuxer.addMetadataEntry(metadataEntry);
+    }
+
+    @Override
+    public void close() throws MuxerException {
+      wrappedMuxer.close();
+    }
+  }
+
   /**
    * Implementation of {@link ByteBufferGlEffect.Processor} that counts how many frames are copied
    * to CPU memory.
@@ -1259,7 +1367,9 @@ public final class AndroidTestUtil {
       Log.i(TAG, testId + ": " + line);
     }
 
-    File analysisFile = createExternalCacheFile(context, /* fileName= */ testId + "-result.txt");
+    File analysisFile =
+        createExternalCacheFile(
+            context, /* directoryName= */ "analysis", /* fileName= */ testId + "-result.txt");
     try (FileWriter fileWriter = new FileWriter(analysisFile)) {
       fileWriter.write(analysisContents);
     }
@@ -1345,42 +1455,6 @@ public final class AndroidTestUtil {
     throw new AssumptionViolatedException("Profile not supported");
   }
 
-  /**
-   * Assumes that the given sample rate is unsupported and returns the fallback sample rate the
-   * device will use to encode.
-   *
-   * @param mimeType The {@linkplain MimeTypes MIME type}.
-   * @param unsupportedSampleRate An unsupported sample rate.
-   * @return The fallback sample rate.
-   * @throws AssumptionViolatedException If the device does not have the required encoder or sample
-   *     rate configuration.
-   */
-  public static int getFallbackAssumingUnsupportedSampleRate(
-      String mimeType, int unsupportedSampleRate) {
-    ImmutableList<MediaCodecInfo> supportedEncoders = EncoderUtil.getSupportedEncoders(mimeType);
-    if (supportedEncoders.isEmpty()) {
-      throw new AssumptionViolatedException("No supported encoders for mime type: " + mimeType);
-    }
-
-    int closestSupportedSampleRate = -1;
-    int minSampleRateCost = Integer.MAX_VALUE;
-    for (int i = 0; i < supportedEncoders.size(); i++) {
-      int actualFallbackSampleRate =
-          EncoderUtil.getClosestSupportedSampleRate(
-              supportedEncoders.get(i), mimeType, unsupportedSampleRate);
-      int sampleRateCost = Math.abs(actualFallbackSampleRate - unsupportedSampleRate);
-      if (sampleRateCost < minSampleRateCost) {
-        minSampleRateCost = sampleRateCost;
-        closestSupportedSampleRate = actualFallbackSampleRate;
-      }
-    }
-    if (closestSupportedSampleRate == unsupportedSampleRate) {
-      throw new AssumptionViolatedException(
-          String.format("Expected sample rate %s to be unsupported", unsupportedSampleRate));
-    }
-    return closestSupportedSampleRate;
-  }
-
   /** Returns a {@link Muxer.Factory} depending upon the API level. */
   public static Muxer.Factory getMuxerFactoryBasedOnApi() {
     // MediaMuxer supports B-frame from API > 24.
@@ -1430,8 +1504,8 @@ public final class AndroidTestUtil {
         && format.height >= 4320
         && format.sampleMimeType != null
         && format.sampleMimeType.equals(MimeTypes.VIDEO_H265)
-        && (Ascii.equalsIgnoreCase(Util.MODEL, "SM-F711U1")
-            || Ascii.equalsIgnoreCase(Util.MODEL, "SM-F926U1"));
+        && (Ascii.equalsIgnoreCase(Build.MODEL, "SM-F711U1")
+            || Ascii.equalsIgnoreCase(Build.MODEL, "SM-F926U1"));
   }
 
   private static boolean canEncode(Format format, boolean isPortraitEncodingEnabled) {
@@ -1470,10 +1544,30 @@ public final class AndroidTestUtil {
    * Creates a {@link File} of the {@code fileName} in the application cache directory.
    *
    * <p>If a file of that name already exists, it is overwritten.
+   *
+   * @param context The {@link Context}.
+   * @param fileName The filename to save to the cache.
    */
   /* package */ static File createExternalCacheFile(Context context, String fileName)
       throws IOException {
-    File file = new File(context.getExternalCacheDir(), fileName);
+    return createExternalCacheFile(context, /* directoryName= */ "", fileName);
+  }
+
+  /**
+   * Creates a {@link File} of the {@code fileName} in a directory {@code directoryName} within the
+   * application cache directory.
+   *
+   * <p>If a file of that name already exists, it is overwritten.
+   *
+   * @param context The {@link Context}.
+   * @param directoryName The directory name within the external cache to save the file in.
+   * @param fileName The filename to save to the cache.
+   */
+  /* package */ static File createExternalCacheFile(
+      Context context, String directoryName, String fileName) throws IOException {
+    File fileDirectory = new File(context.getExternalCacheDir(), directoryName);
+    fileDirectory.mkdirs();
+    File file = new File(fileDirectory, fileName);
     checkState(!file.exists() || file.delete(), "Could not delete file: " + file.getAbsolutePath());
     checkState(file.createNewFile(), "Could not create file: " + file.getAbsolutePath());
     return file;

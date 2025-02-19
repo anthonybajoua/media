@@ -34,6 +34,7 @@ import android.util.Pair;
 import androidx.annotation.CheckResult;
 import androidx.annotation.Nullable;
 import androidx.media3.common.AdPlaybackState;
+import androidx.media3.common.AudioAttributes;
 import androidx.media3.common.C;
 import androidx.media3.common.Format;
 import androidx.media3.common.IllegalSeekPositionException;
@@ -160,6 +161,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
   private static final int MSG_SET_PRELOAD_CONFIGURATION = 28;
   private static final int MSG_PREPARE = 29;
   private static final int MSG_SET_VIDEO_OUTPUT = 30;
+  private static final int MSG_SET_AUDIO_ATTRIBUTES = 31;
+  private static final int MSG_SET_VOLUME = 32;
 
   private static final long BUFFERING_MAXIMUM_INTERVAL_MS =
       Util.usToMs(Renderer.DEFAULT_DURATION_TO_PROGRESS_US);
@@ -449,6 +452,14 @@ import java.util.concurrent.atomic.AtomicBoolean;
         .sendToTarget();
   }
 
+  public void setAudioAttributes(AudioAttributes audioAttributes) {
+    handler.obtainMessage(MSG_SET_AUDIO_ATTRIBUTES, audioAttributes).sendToTarget();
+  }
+
+  public void setVolume(float volume) {
+    handler.obtainMessage(MSG_SET_VOLUME, volume).sendToTarget();
+  }
+
   @Override
   public synchronized void sendMessage(PlayerMessage message) {
     if (released || !playbackLooper.getThread().isAlive()) {
@@ -666,6 +677,12 @@ import java.util.concurrent.atomic.AtomicBoolean;
         case MSG_UPDATE_MEDIA_SOURCES_WITH_MEDIA_ITEMS:
           updateMediaSourcesWithMediaItemsInternal(msg.arg1, msg.arg2, (List<MediaItem>) msg.obj);
           break;
+        case MSG_SET_AUDIO_ATTRIBUTES:
+          setAudioAttributesInternal((AudioAttributes) msg.obj);
+          break;
+        case MSG_SET_VOLUME:
+          setVolumeInternal((Float) msg.obj);
+          break;
         case MSG_RELEASE:
           releaseInternal();
           // Return immediately to not send playback info updates after release.
@@ -676,7 +693,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
     } catch (ExoPlaybackException e) {
       if (e.type == ExoPlaybackException.TYPE_RENDERER) {
         @Nullable MediaPeriodHolder readingPeriod = queue.getReadingPeriod();
-        if (readingPeriod != null) {
+        if (readingPeriod != null && e.mediaPeriodId == null) {
           // We can assume that all renderer errors happen in the context of the reading period. See
           // [internal: b/150584930#comment4] for exceptions that aren't covered by this assumption.
           e =
@@ -935,6 +952,16 @@ import java.util.concurrent.atomic.AtomicBoolean;
     handleMediaSourceListInfoRefreshed(timeline, /* isSourceRefresh= */ false);
   }
 
+  private void setAudioAttributesInternal(AudioAttributes audioAttributes) {
+    trackSelector.setAudioAttributes(audioAttributes);
+  }
+
+  private void setVolumeInternal(float volume) throws ExoPlaybackException {
+    for (RendererHolder renderer : renderers) {
+      renderer.setVolume(volume);
+    }
+  }
+
   private void notifyTrackSelectionPlayWhenReadyChanged(boolean playWhenReady) {
     MediaPeriodHolder periodHolder = queue.getPlayingPeriod();
     while (periodHolder != null) {
@@ -961,6 +988,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
     if (!shouldPlayWhenReady()) {
       stopRenderers();
       updatePlaybackPositions();
+      queue.reevaluateBuffer(rendererPositionUs);
     } else {
       if (playbackInfo.playbackState == Player.STATE_READY) {
         mediaClock.start();
@@ -1363,6 +1391,16 @@ import java.util.concurrent.atomic.AtomicBoolean;
                     rendererHolder.getMinDurationToProgressUs(
                         rendererPositionUs, rendererPositionElapsedRealtimeUs)));
       }
+
+      // Do not schedule next doSomeWork past the playing period transition point.
+      MediaPeriodHolder nextPlayingPeriodHolder =
+          queue.getPlayingPeriod() != null ? queue.getPlayingPeriod().getNext() : null;
+      if (nextPlayingPeriodHolder != null
+          && rendererPositionUs
+                  + msToUs(wakeUpTimeIntervalMs) * playbackInfo.playbackParameters.speed
+              >= nextPlayingPeriodHolder.getStartPositionRendererTime()) {
+        wakeUpTimeIntervalMs = min(wakeUpTimeIntervalMs, BUFFERING_MAXIMUM_INTERVAL_MS);
+      }
     }
     handler.sendEmptyMessageAtTime(
         MSG_DO_SOME_WORK, thisOperationStartTimeMs + wakeUpTimeIntervalMs);
@@ -1530,6 +1568,9 @@ import java.util.concurrent.atomic.AtomicBoolean;
       }
     }
 
+    // Disable pre-warming as following logic will reset any pre-warming media periods.
+    disableAndResetPrewarmingRenderers();
+
     // Do the actual seeking.
     if (newPlayingPeriodHolder != null) {
       queue.removeAfter(newPlayingPeriodHolder);
@@ -1633,6 +1674,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
           /* resetError= */ false);
       releaseRenderers();
       loadControl.onReleased(playerId);
+      trackSelector.release();
       setState(Player.STATE_IDLE);
     } finally {
       playbackLooperProvider.releaseLooper();

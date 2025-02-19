@@ -685,8 +685,10 @@ import org.checkerframework.checker.nullness.qual.PolyNull;
   }
 
   /** Returns a codec specific box. */
+  @SuppressWarnings("MergeCases")
   public static ByteBuffer codecSpecificBox(Format format) {
     String mimeType = checkNotNull(format.sampleMimeType);
+    // LINT.IfChange(codec_specific_boxes)
     switch (mimeType) {
       case MimeTypes.AUDIO_AAC:
       case MimeTypes.AUDIO_VORBIS:
@@ -697,6 +699,8 @@ import org.checkerframework.checker.nullness.qual.PolyNull;
         return damrBox(/* mode= */ (short) 0x83FF); // mode set: all enabled for AMR-WB
       case MimeTypes.AUDIO_OPUS:
         return dOpsBox(format);
+      case MimeTypes.AUDIO_RAW:
+        return ByteBuffer.allocate(0); // No codec specific box for raw audio.
       case MimeTypes.VIDEO_H263:
         return d263Box(format);
       case MimeTypes.VIDEO_H264:
@@ -714,6 +718,8 @@ import org.checkerframework.checker.nullness.qual.PolyNull;
       default:
         throw new IllegalArgumentException("Unsupported format: " + mimeType);
     }
+    // LINT.ThenChange(Mp4Muxer.java:supported_mime_types,
+    // FragmentedMp4Muxer.java:supported_mime_types)
   }
 
   /**
@@ -1517,7 +1523,13 @@ import org.checkerframework.checker.nullness.qual.PolyNull;
     byte[] csd0 = format.initializationData.get(0);
     checkArgument(csd0.length > 0, "csd-0 is empty for avpC box.");
 
-    return BoxUtils.wrapIntoBox("apvC", ByteBuffer.wrap(csd0));
+    int versionAndFlags = 0;
+    ByteBuffer apvcBoxContent = ByteBuffer.allocate(csd0.length + BYTES_PER_INTEGER);
+    apvcBoxContent.putInt(versionAndFlags);
+    apvcBoxContent.put(csd0);
+    apvcBoxContent.flip();
+
+    return BoxUtils.wrapIntoBox("apvC", apvcBoxContent);
   }
 
   /** Returns the av1C box. */
@@ -1690,6 +1702,14 @@ import org.checkerframework.checker.nullness.qual.PolyNull;
         return "s263";
       case MimeTypes.AUDIO_OPUS:
         return "Opus";
+      case MimeTypes.AUDIO_RAW:
+        if (format.pcmEncoding == C.ENCODING_PCM_16BIT) {
+          return "sowt";
+        } else if (format.pcmEncoding == C.ENCODING_PCM_16BIT_BIG_ENDIAN) {
+          return "twos";
+        } else {
+          throw new IllegalArgumentException("Unsupported PCM encoding: " + format.pcmEncoding);
+        }
       case MimeTypes.VIDEO_H264:
         return "avc1";
       case MimeTypes.VIDEO_H265:

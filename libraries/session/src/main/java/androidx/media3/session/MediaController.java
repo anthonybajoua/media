@@ -493,7 +493,7 @@ public class MediaController implements Player {
      */
     @UnstableApi
     default void onSessionActivityChanged(
-        MediaController controller, PendingIntent sessionActivity) {}
+        MediaController controller, @Nullable PendingIntent sessionActivity) {}
 
     /**
      * Called when an non-fatal error {@linkplain
@@ -1986,7 +1986,7 @@ public class MediaController implements Player {
   public final TrackSelectionParameters getTrackSelectionParameters() {
     verifyApplicationThread();
     if (!isConnected()) {
-      return TrackSelectionParameters.DEFAULT_WITHOUT_CONTEXT;
+      return TrackSelectionParameters.DEFAULT;
     }
     return impl.getTrackSelectionParameters();
   }

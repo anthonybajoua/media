@@ -93,7 +93,7 @@ import org.checkerframework.dataflow.qual.Pure;
       boolean portraitEncodingEnabled,
       int maxFramesInEncoder)
       throws ExportException {
-    // TODO(b/278259383) Consider delaying configuration of VideoSampleExporter to use the decoder
+    // TODO: b/278259383 - Consider delaying configuration of VideoSampleExporter to use the decoder
     //  output format instead of the extractor output format, to match AudioSampleExporter behavior.
     super(firstInputFormat, muxerWrapper);
     this.initialTimestampOffsetUs = initialTimestampOffsetUs;
@@ -214,7 +214,10 @@ import org.checkerframework.dataflow.qual.Pure;
 
   @Override
   protected boolean isMuxerInputEnded() {
-    return encoderWrapper.isEnded();
+    // Sometimes the encoder fails to produce an output buffer with end of stream flag after
+    // end of stream is signalled. See b/365484741.
+    // Treat empty encoder (no frames in progress) as if it has ended.
+    return encoderWrapper.isEnded() || videoGraph.hasEncoderReleasedAllBuffersAfterEndOfStream();
   }
 
   /**
@@ -324,7 +327,7 @@ import org.checkerframework.dataflow.qual.Pure;
               .setCodecs(inputFormat.codecs)
               .build();
 
-      // TODO - b/324426022: Move logic for supported mime types to DefaultEncoderFactory.
+      // TODO: b/324426022 - Move logic for supported mime types to DefaultEncoderFactory.
       encoder =
           encoderFactory.createForVideoEncoding(
               requestedEncoderFormat
@@ -392,7 +395,7 @@ import org.checkerframework.dataflow.qual.Pure;
         Format requestedFormat,
         Format supportedFormat,
         @Composition.HdrMode int supportedHdrMode) {
-      // TODO(b/255953153): Consider including bitrate in the revised fallback.
+      // TODO: b/255953153 - Consider including bitrate in the revised fallback.
 
       TransformationRequest.Builder supportedRequestBuilder = transformationRequest.buildUpon();
       if (transformationRequest.hdrMode != supportedHdrMode) {
@@ -580,6 +583,18 @@ import org.checkerframework.dataflow.qual.Pure;
     @Override
     public void release() {
       videoGraph.release();
+    }
+
+    public boolean hasEncoderReleasedAllBuffersAfterEndOfStream() {
+      if (renderFramesAutomatically) {
+        // Video graph wrapper does not track encoder buffers.
+        return false;
+      }
+      boolean isEndOfStreamSeen =
+          (VideoSampleExporter.this.finalFramePresentationTimeUs != C.TIME_UNSET);
+      synchronized (lock) {
+        return framesInEncoder == 0 && isEndOfStreamSeen;
+      }
     }
 
     public void onEncoderBufferReleased() {

@@ -25,6 +25,7 @@ import android.os.Looper;
 import androidx.annotation.IntDef;
 import androidx.annotation.Nullable;
 import androidx.media3.common.C;
+import androidx.media3.common.MimeTypes;
 import androidx.media3.common.util.Log;
 import androidx.media3.common.util.UnstableApi;
 import androidx.media3.exoplayer.audio.AudioRendererEventListener;
@@ -108,6 +109,8 @@ public class DefaultRenderersFactory implements RenderersFactory {
   private boolean enableFloatOutput;
   private boolean enableAudioTrackPlaybackParams;
   private boolean enableMediaCodecVideoRendererPrewarming;
+  private boolean parseAv1SampleDependencies;
+  private long lateThresholdToDropDecoderInputUs;
 
   /**
    * @param context A {@link Context}.
@@ -118,6 +121,7 @@ public class DefaultRenderersFactory implements RenderersFactory {
     extensionRendererMode = EXTENSION_RENDERER_MODE_OFF;
     allowedVideoJoiningTimeMs = DEFAULT_ALLOWED_VIDEO_JOINING_TIME_MS;
     mediaCodecSelector = MediaCodecSelector.DEFAULT;
+    lateThresholdToDropDecoderInputUs = C.TIME_UNSET;
   }
 
   /**
@@ -277,6 +281,24 @@ public class DefaultRenderersFactory implements RenderersFactory {
   }
 
   /**
+   * Sets whether {@link MimeTypes#VIDEO_AV1} bitstream parsing for sample dependency information is
+   * enabled. Knowing which input frames are not depended on can speed up seeking and reduce dropped
+   * frames.
+   *
+   * <p>Defaults to {@code false}.
+   *
+   * <p>This method is experimental and will be renamed or removed in a future release.
+   *
+   * @param parseAv1SampleDependencies Whether bitstream parsing is enabled.
+   */
+  @CanIgnoreReturnValue
+  public final DefaultRenderersFactory experimentalSetParseAv1SampleDependencies(
+      boolean parseAv1SampleDependencies) {
+    this.parseAv1SampleDependencies = parseAv1SampleDependencies;
+    return this;
+  }
+
+  /**
    * Sets the maximum duration for which video renderers can attempt to seamlessly join an ongoing
    * playback.
    *
@@ -290,6 +312,24 @@ public class DefaultRenderersFactory implements RenderersFactory {
   public final DefaultRenderersFactory setAllowedVideoJoiningTimeMs(
       long allowedVideoJoiningTimeMs) {
     this.allowedVideoJoiningTimeMs = allowedVideoJoiningTimeMs;
+    return this;
+  }
+
+  /**
+   * Sets the late threshold for rendered output buffers, in microseconds, after which decoder input
+   * buffers may be dropped.
+   *
+   * <p>The default value is {@link C#TIME_UNSET} and therefore no input buffers will be dropped due
+   * to this logic.
+   *
+   * <p>This method is experimental and will be renamed or removed in a future release.
+   *
+   * @param lateThresholdToDropDecoderInputUs The threshold.
+   */
+  @CanIgnoreReturnValue
+  public final DefaultRenderersFactory experimentalSetLateThresholdToDropDecoderInputUs(
+      long lateThresholdToDropDecoderInputUs) {
+    this.lateThresholdToDropDecoderInputUs = lateThresholdToDropDecoderInputUs;
     return this;
   }
 
@@ -367,15 +407,17 @@ public class DefaultRenderersFactory implements RenderersFactory {
       long allowedVideoJoiningTimeMs,
       ArrayList<Renderer> out) {
     MediaCodecVideoRenderer videoRenderer =
-        new MediaCodecVideoRenderer(
-            context,
-            getCodecAdapterFactory(),
-            mediaCodecSelector,
-            allowedVideoJoiningTimeMs,
-            enableDecoderFallback,
-            eventHandler,
-            eventListener,
-            MAX_DROPPED_VIDEO_FRAME_COUNT_TO_NOTIFY);
+        new MediaCodecVideoRenderer.Builder(context)
+            .setCodecAdapterFactory(getCodecAdapterFactory())
+            .setMediaCodecSelector(mediaCodecSelector)
+            .setAllowedJoiningTimeMs(allowedVideoJoiningTimeMs)
+            .setEnableDecoderFallback(enableDecoderFallback)
+            .setEventHandler(eventHandler)
+            .setEventListener(eventListener)
+            .setMaxDroppedFramesToNotify(MAX_DROPPED_VIDEO_FRAME_COUNT_TO_NOTIFY)
+            .experimentalSetParseAv1SampleDependencies(parseAv1SampleDependencies)
+            .experimentalSetLateThresholdToDropDecoderInputUs(lateThresholdToDropDecoderInputUs)
+            .build();
     out.add(videoRenderer);
 
     if (extensionRendererMode == EXTENSION_RENDERER_MODE_OFF) {
@@ -388,6 +430,7 @@ public class DefaultRenderersFactory implements RenderersFactory {
 
     try {
       // Full class names used for constructor args so the LINT rule triggers if any of them move.
+      // LINT.IfChange
       Class<?> clazz = Class.forName("androidx.media3.decoder.vp9.LibvpxVideoRenderer");
       Constructor<?> constructor =
           clazz.getConstructor(
@@ -395,6 +438,7 @@ public class DefaultRenderersFactory implements RenderersFactory {
               android.os.Handler.class,
               androidx.media3.exoplayer.video.VideoRendererEventListener.class,
               int.class);
+      // LINT.ThenChange(../../../../../../proguard-rules.txt)
       Renderer renderer =
           (Renderer)
               constructor.newInstance(
@@ -413,6 +457,7 @@ public class DefaultRenderersFactory implements RenderersFactory {
 
     try {
       // Full class names used for constructor args so the LINT rule triggers if any of them move.
+      // LINT.IfChange
       Class<?> clazz = Class.forName("androidx.media3.decoder.av1.Libgav1VideoRenderer");
       Constructor<?> constructor =
           clazz.getConstructor(
@@ -420,6 +465,7 @@ public class DefaultRenderersFactory implements RenderersFactory {
               android.os.Handler.class,
               androidx.media3.exoplayer.video.VideoRendererEventListener.class,
               int.class);
+      // LINT.ThenChange(../../../../../../proguard-rules.txt)
       Renderer renderer =
           (Renderer)
               constructor.newInstance(
@@ -438,6 +484,7 @@ public class DefaultRenderersFactory implements RenderersFactory {
 
     try {
       // Full class names used for constructor args so the LINT rule triggers if any of them move.
+      // LINT.IfChange
       Class<?> clazz =
           Class.forName("androidx.media3.decoder.ffmpeg.ExperimentalFfmpegVideoRenderer");
       Constructor<?> constructor =
@@ -446,6 +493,7 @@ public class DefaultRenderersFactory implements RenderersFactory {
               android.os.Handler.class,
               androidx.media3.exoplayer.video.VideoRendererEventListener.class,
               int.class);
+      // LINT.ThenChange(../../../../../../proguard-rules.txt)
       Renderer renderer =
           (Renderer)
               constructor.newInstance(
@@ -507,8 +555,10 @@ public class DefaultRenderersFactory implements RenderersFactory {
 
     try {
       // Full class names used for constructor args so the LINT rule triggers if any of them move.
+      // LINT.IfChange
       Class<?> clazz = Class.forName("androidx.media3.decoder.midi.MidiRenderer");
       Constructor<?> constructor = clazz.getConstructor(Context.class);
+      // LINT.ThenChange(../../../../../../proguard-rules.txt)
       Renderer renderer = (Renderer) constructor.newInstance(context);
       out.add(extensionRendererIndex++, renderer);
       Log.i(TAG, "Loaded MidiRenderer.");
@@ -521,12 +571,14 @@ public class DefaultRenderersFactory implements RenderersFactory {
 
     try {
       // Full class names used for constructor args so the LINT rule triggers if any of them move.
+      // LINT.IfChange
       Class<?> clazz = Class.forName("androidx.media3.decoder.opus.LibopusAudioRenderer");
       Constructor<?> constructor =
           clazz.getConstructor(
               android.os.Handler.class,
               androidx.media3.exoplayer.audio.AudioRendererEventListener.class,
               androidx.media3.exoplayer.audio.AudioSink.class);
+      // LINT.ThenChange(../../../../../../proguard-rules.txt)
       Renderer renderer =
           (Renderer) constructor.newInstance(eventHandler, eventListener, audioSink);
       out.add(extensionRendererIndex++, renderer);
@@ -540,12 +592,14 @@ public class DefaultRenderersFactory implements RenderersFactory {
 
     try {
       // Full class names used for constructor args so the LINT rule triggers if any of them move.
+      // LINT.IfChange
       Class<?> clazz = Class.forName("androidx.media3.decoder.flac.LibflacAudioRenderer");
       Constructor<?> constructor =
           clazz.getConstructor(
               android.os.Handler.class,
               androidx.media3.exoplayer.audio.AudioRendererEventListener.class,
               androidx.media3.exoplayer.audio.AudioSink.class);
+      // LINT.ThenChange(../../../../../../proguard-rules.txt)
       Renderer renderer =
           (Renderer) constructor.newInstance(eventHandler, eventListener, audioSink);
       out.add(extensionRendererIndex++, renderer);
@@ -559,12 +613,14 @@ public class DefaultRenderersFactory implements RenderersFactory {
 
     try {
       // Full class names used for constructor args so the LINT rule triggers if any of them move.
+      // LINT.IfChange
       Class<?> clazz = Class.forName("androidx.media3.decoder.ffmpeg.FfmpegAudioRenderer");
       Constructor<?> constructor =
           clazz.getConstructor(
               android.os.Handler.class,
               androidx.media3.exoplayer.audio.AudioRendererEventListener.class,
               androidx.media3.exoplayer.audio.AudioSink.class);
+      // LINT.ThenChange(../../../../../../proguard-rules.txt)
       Renderer renderer =
           (Renderer) constructor.newInstance(eventHandler, eventListener, audioSink);
       out.add(extensionRendererIndex++, renderer);
@@ -578,6 +634,7 @@ public class DefaultRenderersFactory implements RenderersFactory {
 
     try {
       // Full class names used for constructor args so the LINT rule triggers if any of them move.
+      // LINT.IfChange
       Class<?> clazz = Class.forName("androidx.media3.decoder.iamf.LibiamfAudioRenderer");
       Constructor<?> constructor =
           clazz.getConstructor(
@@ -585,6 +642,7 @@ public class DefaultRenderersFactory implements RenderersFactory {
               android.os.Handler.class,
               androidx.media3.exoplayer.audio.AudioRendererEventListener.class,
               androidx.media3.exoplayer.audio.AudioSink.class);
+      // LINT.ThenChange(../../../../../../proguard-rules.txt)
       Renderer renderer =
           (Renderer) constructor.newInstance(context, eventHandler, eventListener, audioSink);
       out.add(extensionRendererIndex++, renderer);
@@ -770,15 +828,17 @@ public class DefaultRenderersFactory implements RenderersFactory {
       long allowedVideoJoiningTimeMs) {
     if (enableMediaCodecVideoRendererPrewarming
         && renderer.getClass() == MediaCodecVideoRenderer.class) {
-      return new MediaCodecVideoRenderer(
-          context,
-          getCodecAdapterFactory(),
-          mediaCodecSelector,
-          allowedVideoJoiningTimeMs,
-          enableDecoderFallback,
-          eventHandler,
-          eventListener,
-          MAX_DROPPED_VIDEO_FRAME_COUNT_TO_NOTIFY);
+      return new MediaCodecVideoRenderer.Builder(context)
+          .setCodecAdapterFactory(getCodecAdapterFactory())
+          .setMediaCodecSelector(mediaCodecSelector)
+          .setAllowedJoiningTimeMs(allowedVideoJoiningTimeMs)
+          .setEnableDecoderFallback(enableDecoderFallback)
+          .setEventHandler(eventHandler)
+          .setEventListener(eventListener)
+          .setMaxDroppedFramesToNotify(MAX_DROPPED_VIDEO_FRAME_COUNT_TO_NOTIFY)
+          .experimentalSetParseAv1SampleDependencies(parseAv1SampleDependencies)
+          .experimentalSetLateThresholdToDropDecoderInputUs(lateThresholdToDropDecoderInputUs)
+          .build();
     }
     return null;
   }

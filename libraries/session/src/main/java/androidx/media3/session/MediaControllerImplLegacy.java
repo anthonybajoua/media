@@ -1345,7 +1345,7 @@ import org.checkerframework.checker.initialization.qual.UnderInitialization;
 
   @Override
   public TrackSelectionParameters getTrackSelectionParameters() {
-    return TrackSelectionParameters.DEFAULT_WITHOUT_CONTEXT;
+    return TrackSelectionParameters.DEFAULT;
   }
 
   @Override
@@ -1647,16 +1647,20 @@ import org.checkerframework.checker.initialization.qual.UnderInitialization;
       if (!oldControllerInfo.mediaButtonPreferences.equals(
           newControllerInfo.mediaButtonPreferences)) {
         getInstance()
-            .notifyControllerListener(
-                listener -> {
-                  ignoreFuture(
-                      listener.onSetCustomLayout(
-                          getInstance(), newControllerInfo.mediaButtonPreferences));
-                  listener.onCustomLayoutChanged(
-                      getInstance(), newControllerInfo.mediaButtonPreferences);
-                  listener.onMediaButtonPreferencesChanged(
-                      getInstance(), newControllerInfo.mediaButtonPreferences);
-                });
+            .applicationHandler
+            .post(
+                () ->
+                    getInstance()
+                        .notifyControllerListener(
+                            listener -> {
+                              ignoreFuture(
+                                  listener.onSetCustomLayout(
+                                      getInstance(), newControllerInfo.mediaButtonPreferences));
+                              listener.onCustomLayoutChanged(
+                                  getInstance(), newControllerInfo.mediaButtonPreferences);
+                              listener.onMediaButtonPreferencesChanged(
+                                  getInstance(), newControllerInfo.mediaButtonPreferences);
+                            }));
       }
       return;
     }
@@ -2434,7 +2438,7 @@ import org.checkerframework.checker.initialization.qual.UnderInitialization;
             seekForwardIncrementMs,
             maxSeekToPreviousPositionMs,
             /* currentTracks= */ Tracks.EMPTY,
-            /* parameters= */ TrackSelectionParameters.DEFAULT_WITHOUT_CONTEXT);
+            /* parameters= */ TrackSelectionParameters.DEFAULT);
 
     return new ControllerInfo(
         playerInfo,

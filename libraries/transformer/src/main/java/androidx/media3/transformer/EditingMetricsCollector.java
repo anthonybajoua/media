@@ -16,7 +16,7 @@
 
 package androidx.media3.transformer;
 
-import static androidx.media3.common.util.Assertions.checkNotNull;
+import static androidx.media3.common.util.Assertions.checkState;
 import static androidx.media3.common.util.Util.usToMs;
 
 import android.content.Context;
@@ -32,19 +32,92 @@ import androidx.annotation.RequiresApi;
 import androidx.media3.common.C;
 import androidx.media3.common.ColorInfo;
 import androidx.media3.common.Format;
+import androidx.media3.common.MimeTypes;
+import androidx.media3.common.util.Log;
 import androidx.media3.common.util.SystemClock;
 import com.google.common.collect.ImmutableList;
 import java.util.ArrayList;
 import java.util.List;
-import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
 
 /**
- * A metrics collector that collects editing events and forwards them to an {@link EditingSession}
- * created by {@link MediaMetricsManager}.
+ * A metrics collector that collects editing events and forwards them to {@link MetricsReporter}.
  */
 @RequiresApi(35)
 /* package */ final class EditingMetricsCollector {
 
+  /** Reports the collected metrics. */
+  public interface MetricsReporter extends AutoCloseable {
+    /** Factory for metrics reporters */
+    interface Factory {
+      /** Returns a new {@link MetricsReporter}. */
+      MetricsReporter create();
+    }
+
+    /**
+     * Reports the given {@link EditingEndedEvent}.
+     *
+     * <p>The method should be called at most once.
+     */
+    void reportMetrics(EditingEndedEvent editingEndedEvent);
+  }
+
+  /**
+   * A default implementation of {@link MetricsReporter} that reports metrics to an {@link
+   * EditingSession}.
+   */
+  static final class DefaultMetricsReporter implements MetricsReporter {
+    /** A {@link MetricsReporter.Factory} for {@link DefaultMetricsReporter}. */
+    public static final class Factory implements MetricsReporter.Factory {
+      private final Context context;
+
+      /**
+       * Creates an instance.
+       *
+       * @param context The {@link Context}.
+       */
+      public Factory(Context context) {
+        this.context = context;
+      }
+
+      @Override
+      public MetricsReporter create() {
+        return new DefaultMetricsReporter(context);
+      }
+    }
+
+    /** The {@link EditingSession} to report collected metrics to. */
+    @Nullable private EditingSession editingSession;
+
+    private boolean metricsReported;
+
+    private DefaultMetricsReporter(Context context) {
+      @Nullable
+      MediaMetricsManager mediaMetricsManager =
+          (MediaMetricsManager) context.getSystemService(Context.MEDIA_METRICS_SERVICE);
+      if (mediaMetricsManager != null) {
+        editingSession = mediaMetricsManager.createEditingSession();
+      }
+    }
+
+    @Override
+    public void reportMetrics(EditingEndedEvent editingEndedEvent) {
+      checkState(!metricsReported, "Metrics have already been reported.");
+      if (editingSession != null) {
+        editingSession.reportEditingEndedEvent(editingEndedEvent);
+        metricsReported = true;
+      }
+    }
+
+    @Override
+    public void close() {
+      if (editingSession != null) {
+        editingSession.close();
+        editingSession = null;
+      }
+    }
+  }
+
+  private static final String TAG = "EditingMetricsCollector";
   // TODO: b/386328723 - Add missing error codes to EditingEndedEvent.ErrorCode.
   private static final SparseIntArray ERROR_CODE_CONVERSION_MAP = new SparseIntArray();
   private static final SparseIntArray DATA_SPACE_STANDARD_CONVERSION_MAP = new SparseIntArray();
@@ -127,47 +200,57 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
   }
 
   private static final int SUCCESS_PROGRESS_PERCENTAGE = 100;
-  private @MonotonicNonNull EditingSession editingSession;
-  private long startTimeMs;
+  private final long startTimeMs;
+  private final String exporterName;
+  @Nullable private final String muxerName;
+  private final MetricsReporter metricsReporter;
 
   /**
    * Creates an instance.
    *
    * <p>A new instance must be created before starting a new export.
    *
-   * @param context The {@link Context}.
+   * <p>Both {@code exporterName} and {@code muxerName} should follow the format
+   * "<packageName>:<version>".
+   *
+   * @param metricsReporter The {@link MetricsReporter} to report metrics.
+   * @param exporterName Java package name and version of the library or application implementing
+   *     the editing operation.
+   * @param muxerName Java package name and version of the library or application that writes to the
+   *     output file.
    */
-  public EditingMetricsCollector(Context context) {
-    @Nullable
-    MediaMetricsManager mediaMetricsManager =
-        (MediaMetricsManager) context.getSystemService(Context.MEDIA_METRICS_SERVICE);
-    if (mediaMetricsManager != null) {
-      editingSession = checkNotNull(mediaMetricsManager.createEditingSession());
-      startTimeMs = SystemClock.DEFAULT.elapsedRealtime();
-    }
+  public EditingMetricsCollector(
+      MetricsReporter metricsReporter, String exporterName, @Nullable String muxerName) {
+    this.metricsReporter = metricsReporter;
+    this.exporterName = exporterName;
+    this.muxerName = muxerName;
+    startTimeMs = SystemClock.DEFAULT.elapsedRealtime();
   }
 
   /**
    * Called when export completes with success.
    *
-   * @param processedInputs The list of {@link ExportResult.ProcessedInput} instances.
+   * @param exportResult The {@link ExportResult} of the export.
    */
-  public void onExportSuccess(ImmutableList<ExportResult.ProcessedInput> processedInputs) {
-    if (editingSession == null) {
-      return;
-    }
+  public void onExportSuccess(ExportResult exportResult) {
     EditingEndedEvent.Builder editingEndedEventBuilder =
         createEditingEndedEventBuilder(EditingEndedEvent.FINAL_STATE_SUCCEEDED)
             .setFinalProgressPercent(SUCCESS_PROGRESS_PERCENTAGE);
 
-    List<MediaItemInfo> inputMediaItemInfoList = getMediaItemInfos(processedInputs);
+    List<MediaItemInfo> inputMediaItemInfoList =
+        getInputMediaItemInfos(exportResult.processedInputs);
     for (int i = 0; i < inputMediaItemInfoList.size(); i++) {
       MediaItemInfo inputMediaItemInfo = inputMediaItemInfoList.get(i);
       editingEndedEventBuilder.addInputMediaItemInfo(inputMediaItemInfo);
     }
+    editingEndedEventBuilder.setOutputMediaItemInfo(getOutputMediaItemInfo(exportResult));
 
-    editingSession.reportEditingEndedEvent(editingEndedEventBuilder.build());
-    editingSession.close();
+    metricsReporter.reportMetrics(editingEndedEventBuilder.build());
+    try {
+      metricsReporter.close();
+    } catch (Exception e) {
+      Log.e(TAG, "error while closing the metrics reporter", e);
+    }
   }
 
   /**
@@ -176,15 +259,10 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
    * @param progressPercentage The progress of the export operation in percent. Value is {@link
    *     C#PERCENTAGE_UNSET} if unknown or between 0 and 100 inclusive.
    * @param exportException The {@link ExportException} describing the exception.
-   * @param processedInputs The list of {@link ExportResult.ProcessedInput} instances.
+   * @param exportResult The {@link ExportResult} of the export.
    */
   public void onExportError(
-      int progressPercentage,
-      ExportException exportException,
-      ImmutableList<ExportResult.ProcessedInput> processedInputs) {
-    if (editingSession == null) {
-      return;
-    }
+      int progressPercentage, ExportException exportException, ExportResult exportResult) {
     EditingEndedEvent.Builder editingEndedEventBuilder =
         createEditingEndedEventBuilder(EditingEndedEvent.FINAL_STATE_ERROR)
             .setErrorCode(getEditingEndedEventErrorCode(exportException.errorCode));
@@ -192,14 +270,20 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
       editingEndedEventBuilder.setFinalProgressPercent(progressPercentage);
     }
 
-    List<MediaItemInfo> inputMediaItemInfoList = getMediaItemInfos(processedInputs);
+    List<MediaItemInfo> inputMediaItemInfoList =
+        getInputMediaItemInfos(exportResult.processedInputs);
     for (int i = 0; i < inputMediaItemInfoList.size(); i++) {
       MediaItemInfo inputMediaItemInfo = inputMediaItemInfoList.get(i);
       editingEndedEventBuilder.addInputMediaItemInfo(inputMediaItemInfo);
     }
+    editingEndedEventBuilder.setOutputMediaItemInfo(getOutputMediaItemInfo(exportResult));
 
-    editingSession.reportEditingEndedEvent(editingEndedEventBuilder.build());
-    editingSession.close();
+    metricsReporter.reportMetrics(editingEndedEventBuilder.build());
+    try {
+      metricsReporter.close();
+    } catch (Exception e) {
+      Log.e(TAG, "error while closing the metrics reporter", e);
+    }
   }
 
   /**
@@ -209,66 +293,156 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
    *     C#PERCENTAGE_UNSET} if unknown or between 0 and 100 inclusive.
    */
   public void onExportCancelled(int progressPercentage) {
-    if (editingSession == null) {
-      return;
-    }
     EditingEndedEvent.Builder editingEndedEventBuilder =
         createEditingEndedEventBuilder(EditingEndedEvent.FINAL_STATE_CANCELED);
     if (progressPercentage != C.PERCENTAGE_UNSET) {
       editingEndedEventBuilder.setFinalProgressPercent(progressPercentage);
     }
-    editingSession.reportEditingEndedEvent(editingEndedEventBuilder.build());
-    editingSession.close();
+
+    metricsReporter.reportMetrics(editingEndedEventBuilder.build());
+    try {
+      metricsReporter.close();
+    } catch (Exception e) {
+      Log.e(TAG, "error while closing the metrics reporter", e);
+    }
   }
 
   private EditingEndedEvent.Builder createEditingEndedEventBuilder(int finalState) {
     long endTimeMs = SystemClock.DEFAULT.elapsedRealtime();
-    return new EditingEndedEvent.Builder(finalState)
-        .setTimeSinceCreatedMillis(endTimeMs - startTimeMs);
+    EditingEndedEvent.Builder editingEndedEventBuilder =
+        new EditingEndedEvent.Builder(finalState)
+            .setTimeSinceCreatedMillis(endTimeMs - startTimeMs)
+            .setExporterName(exporterName);
+    if (muxerName != null) {
+      // TODO: b/391888233 - Update `PATTERN_KNOWN_EDITING_LIBRARY_NAMES` regex pattern to accept
+      //  Framework Muxer's library name.
+      editingEndedEventBuilder.setMuxerName(muxerName);
+    }
+    return editingEndedEventBuilder;
   }
 
-  private static List<MediaItemInfo> getMediaItemInfos(
+  private static List<MediaItemInfo> getInputMediaItemInfos(
       ImmutableList<ExportResult.ProcessedInput> processedInputs) {
     List<MediaItemInfo> mediaItemInfoList = new ArrayList<>();
     for (int i = 0; i < processedInputs.size(); i++) {
       ExportResult.ProcessedInput processedInput = processedInputs.get(i);
       MediaItemInfo.Builder mediaItemInfoBuilder = new MediaItemInfo.Builder();
       long durationMs = usToMs(processedInput.durationUs);
-      mediaItemInfoBuilder.setDurationMillis(durationMs);
-      Format format = processedInput.format;
-      if (format != null) {
-        if (format.containerMimeType != null) {
-          mediaItemInfoBuilder.setContainerMimeType(format.containerMimeType);
+      mediaItemInfoBuilder.setClipDurationMillis(durationMs);
+      if (processedInput.videoDecoderName != null) {
+        mediaItemInfoBuilder.addCodecName(processedInput.videoDecoderName);
+      }
+      if (processedInput.audioDecoderName != null) {
+        mediaItemInfoBuilder.addCodecName(processedInput.audioDecoderName);
+      }
+      @Nullable Format videoFormat = processedInput.videoFormat;
+      if (videoFormat != null) {
+        if (videoFormat.containerMimeType != null) {
+          mediaItemInfoBuilder.setContainerMimeType(videoFormat.containerMimeType);
         }
-        if (format.sampleMimeType != null) {
-          mediaItemInfoBuilder.addSampleMimeType(format.sampleMimeType);
+        if (videoFormat.sampleMimeType != null) {
+          mediaItemInfoBuilder.addSampleMimeType(videoFormat.sampleMimeType);
+          mediaItemInfoBuilder.addDataType(getDataTypes(videoFormat.sampleMimeType));
         }
-        if (format.frameRate != Format.NO_VALUE) {
-          mediaItemInfoBuilder.setVideoFrameRate(format.frameRate);
+        if (videoFormat.frameRate != Format.NO_VALUE) {
+          mediaItemInfoBuilder.setVideoFrameRate(videoFormat.frameRate);
         }
         Size videoSize =
             new Size(
-                format.width != Format.NO_VALUE ? format.width : MediaItemInfo.VALUE_UNSPECIFIED,
-                format.height != Format.NO_VALUE ? format.height : MediaItemInfo.VALUE_UNSPECIFIED);
+                videoFormat.width != Format.NO_VALUE
+                    ? videoFormat.width
+                    : MediaItemInfo.VALUE_UNSPECIFIED,
+                videoFormat.height != Format.NO_VALUE
+                    ? videoFormat.height
+                    : MediaItemInfo.VALUE_UNSPECIFIED);
         mediaItemInfoBuilder.setVideoSize(videoSize);
-        if (format.colorInfo != null) {
-          ColorInfo colorInfo = format.colorInfo;
-          int colorStandard =
-              DATA_SPACE_STANDARD_CONVERSION_MAP.get(
-                  colorInfo.colorSpace, DataSpace.STANDARD_UNSPECIFIED);
-          int colorTransfer =
-              DATA_SPACE_TRANSFER_CONVERSION_MAP.get(
-                  colorInfo.colorTransfer, DataSpace.TRANSFER_UNSPECIFIED);
-          int colorRange =
-              DATA_SPACE_RANGE_CONVERSION_MAP.get(
-                  colorInfo.colorRange, DataSpace.RANGE_UNSPECIFIED);
-          mediaItemInfoBuilder.setVideoDataSpace(
-              DataSpace.pack(colorStandard, colorTransfer, colorRange));
+        if (videoFormat.colorInfo != null) {
+          mediaItemInfoBuilder.setVideoDataSpace(getVideoDataSpace(videoFormat.colorInfo));
+        }
+      }
+      Format audioFormat = processedInput.audioFormat;
+      if (audioFormat != null) {
+        if (audioFormat.sampleMimeType != null) {
+          mediaItemInfoBuilder.addSampleMimeType(audioFormat.sampleMimeType);
+          mediaItemInfoBuilder.addDataType(getDataTypes(audioFormat.sampleMimeType));
+        }
+        if (audioFormat.channelCount != Format.NO_VALUE) {
+          mediaItemInfoBuilder.setAudioChannelCount(audioFormat.channelCount);
+        }
+        if (audioFormat.sampleRate != Format.NO_VALUE) {
+          mediaItemInfoBuilder.setAudioSampleRateHz(audioFormat.sampleRate);
         }
       }
       mediaItemInfoList.add(mediaItemInfoBuilder.build());
     }
     return mediaItemInfoList;
+  }
+
+  private static MediaItemInfo getOutputMediaItemInfo(ExportResult exportResult) {
+    MediaItemInfo.Builder mediaItemInfoBuilder = new MediaItemInfo.Builder();
+    if (exportResult.durationMs != C.TIME_UNSET) {
+      mediaItemInfoBuilder.setDurationMillis(exportResult.durationMs);
+    }
+    if (exportResult.audioMimeType != null) {
+      mediaItemInfoBuilder.addSampleMimeType(exportResult.audioMimeType);
+      mediaItemInfoBuilder.addDataType(getDataTypes(exportResult.audioMimeType));
+    }
+    if (exportResult.videoMimeType != null) {
+      mediaItemInfoBuilder.addSampleMimeType(exportResult.videoMimeType);
+      mediaItemInfoBuilder.addDataType(getDataTypes(exportResult.videoMimeType));
+    }
+    if (exportResult.channelCount != C.LENGTH_UNSET) {
+      mediaItemInfoBuilder.setAudioChannelCount(exportResult.channelCount);
+    }
+    if (exportResult.sampleRate != C.RATE_UNSET_INT) {
+      mediaItemInfoBuilder.setAudioSampleRateHz(exportResult.sampleRate);
+    }
+    if (exportResult.audioEncoderName != null) {
+      mediaItemInfoBuilder.addCodecName(exportResult.audioEncoderName);
+    }
+    if (exportResult.videoEncoderName != null) {
+      mediaItemInfoBuilder.addCodecName(exportResult.videoEncoderName);
+    }
+    mediaItemInfoBuilder.setVideoSampleCount(exportResult.videoFrameCount);
+    Size videoSize =
+        new Size(
+            exportResult.width != C.LENGTH_UNSET
+                ? exportResult.width
+                : MediaItemInfo.VALUE_UNSPECIFIED,
+            exportResult.height != C.LENGTH_UNSET
+                ? exportResult.height
+                : MediaItemInfo.VALUE_UNSPECIFIED);
+    mediaItemInfoBuilder.setVideoSize(videoSize);
+    if (exportResult.colorInfo != null) {
+      mediaItemInfoBuilder.setVideoDataSpace(getVideoDataSpace(exportResult.colorInfo));
+    }
+    return mediaItemInfoBuilder.build();
+  }
+
+  private static long getDataTypes(@Nullable String sampleMimeType) {
+    long dataTypes = 0L;
+    if (MimeTypes.isAudio(sampleMimeType)) {
+      dataTypes |= MediaItemInfo.DATA_TYPE_AUDIO;
+    }
+    if (MimeTypes.isVideo(sampleMimeType)) {
+      dataTypes |= MediaItemInfo.DATA_TYPE_VIDEO;
+    }
+    if (MimeTypes.isImage(sampleMimeType)) {
+      dataTypes |= MediaItemInfo.DATA_TYPE_IMAGE;
+    }
+    return dataTypes;
+  }
+
+  private static int getVideoDataSpace(ColorInfo colorInfo) {
+    int colorStandard =
+        DATA_SPACE_STANDARD_CONVERSION_MAP.get(
+            colorInfo.colorSpace, DataSpace.STANDARD_UNSPECIFIED);
+    int colorTransfer =
+        DATA_SPACE_TRANSFER_CONVERSION_MAP.get(
+            colorInfo.colorTransfer, DataSpace.TRANSFER_UNSPECIFIED);
+    int colorRange =
+        DATA_SPACE_RANGE_CONVERSION_MAP.get(colorInfo.colorRange, DataSpace.RANGE_UNSPECIFIED);
+    return DataSpace.pack(colorStandard, colorTransfer, colorRange);
   }
 
   private static int getEditingEndedEventErrorCode(@ExportException.ErrorCode int errorCode) {

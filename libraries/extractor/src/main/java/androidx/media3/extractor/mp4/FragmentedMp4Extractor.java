@@ -246,11 +246,11 @@ public class FragmentedMp4Extractor implements Extractor {
 
   // Whether extractorOutput.seekMap has been called.
   private boolean haveOutputSeekMap;
+
   // Whether a fragmented sidx has been fully collected and output.
   private boolean haveOutputSeekMapComplete;
   private final ChunkIndicesWrapper wrappingSegmentIndex = new ChunkIndicesWrapper();
-  // Flag to reset caller seek to 0
-  private boolean haveResetCallerSeek;
+  private long resetCallerSeekTo;
 
   /**
    * @deprecated Use {@link #FragmentedMp4Extractor(SubtitleParser.Factory)} instead
@@ -535,30 +535,36 @@ public class FragmentedMp4Extractor implements Extractor {
 
   @Override
   public int read(ExtractorInput input, PositionHolder seekPosition) throws IOException {
-    while (true) {
-      switch (parserState) {
-        case STATE_READING_ATOM_HEADER:
-          if (!readAtomHeader(input, false)) {
-            if (haveResetCallerSeek) {
-              haveResetCallerSeek = false;
-              seekPosition.position = 0;
-              return Extractor.RESULT_SEEK;
-            } else {
-              reorderingSeiMessageQueue.flush();
-              return Extractor.RESULT_END_OF_INPUT;
+    try {
+      while (true) {
+        switch (parserState) {
+          case STATE_READING_ATOM_HEADER:
+            if (!readAtomHeader(input, false)) {
+              if (resetCallerSeekTo > 0) {
+                seekPosition.position = resetCallerSeekTo;
+                return Extractor.RESULT_SEEK;
+              } else {
+                reorderingSeiMessageQueue.flush();
+                return Extractor.RESULT_END_OF_INPUT;
+              }
             }
-          }
-          break;
-        case STATE_READING_ATOM_PAYLOAD:
-          readAtomPayload(input);
-          break;
-        case STATE_READING_ENCRYPTION_DATA:
-          readEncryptionData(input);
-          break;
-        default:
-          if (readSample(input)) {
-            return RESULT_CONTINUE;
-          }
+            break;
+          case STATE_READING_ATOM_PAYLOAD:
+            readAtomPayload(input);
+            break;
+          case STATE_READING_ENCRYPTION_DATA:
+            readEncryptionData(input);
+            break;
+          default:
+            if (readSample(input)) {
+              return RESULT_CONTINUE;
+            }
+        }
+      }
+    } finally {
+      if (resetCallerSeekTo > 0) {
+        seekPosition.position = resetCallerSeekTo;
+        resetCallerSeekTo = 0;
       }
     }
   }
@@ -700,11 +706,13 @@ public class FragmentedMp4Extractor implements Extractor {
         extractorOutput.seekMap(result.second);
         haveOutputSeekMap = true;
       } else if (!haveOutputSeekMapComplete && wrappingSegmentIndex.size() > 1) {
-        haveOutputSeekMapComplete = true;
-        haveResetCallerSeek = true;
-        readRemainingSidxAtomsIntoTrack(input);
-        extractorOutput.seekMap(wrappingSegmentIndex.toChunkIndex());
-        wrappingSegmentIndex.clear(); // Clear to not store in memory now unneeded.
+        resetCallerSeekTo = inputPosition;
+        try {
+          readRemainingSidxAtomsIntoTrack(input);
+          haveOutputSeekMapComplete = true;
+        } finally {
+          extractorOutput.seekMap(wrappingSegmentIndex.toChunkIndex());
+        }
       }
     } else if (leaf.type == Mp4Box.TYPE_emsg) {
       onEmsgLeafAtomRead(leaf.data);

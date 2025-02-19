@@ -211,7 +211,7 @@ public class CompositionPlayerTest {
 
     player.setComposition(buildComposition());
     player.prepare();
-    TestPlayerRunHelper.run(player).untilState(Player.STATE_READY);
+    TestPlayerRunHelper.advance(player).untilState(Player.STATE_READY);
 
     player.release();
 
@@ -620,9 +620,10 @@ public class CompositionPlayerTest {
     TestPlayerRunHelper.runUntilPlaybackState(player, Player.STATE_ENDED);
     inOrder.verify(listener).onPlaybackStateChanged(Player.STATE_ENDED);
 
-    player.release();
+    player.stop();
     TestPlayerRunHelper.runUntilPlaybackState(player, Player.STATE_IDLE);
     inOrder.verify(listener).onPlaybackStateChanged(Player.STATE_IDLE);
+    player.release();
 
     assertThat(playbackStates)
         .containsExactly(
@@ -837,7 +838,7 @@ public class CompositionPlayerTest {
     player.play();
 
     player.seekTo(/* positionMs= */ 1100);
-    TestPlayerRunHelper.run(player).untilState(Player.STATE_ENDED);
+    TestPlayerRunHelper.advance(player).untilState(Player.STATE_ENDED);
     player.release();
   }
 

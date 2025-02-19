@@ -36,6 +36,7 @@ import android.media.MediaCodecInfo.CodecCapabilities;
 import android.media.MediaCodecInfo.CodecProfileLevel;
 import android.media.MediaCrypto;
 import android.media.MediaFormat;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Message;
@@ -78,8 +79,10 @@ import androidx.media3.exoplayer.mediacodec.MediaCodecUtil.DecoderQueryException
 import androidx.media3.exoplayer.source.MediaSource;
 import androidx.media3.exoplayer.video.VideoRendererEventListener.EventDispatcher;
 import com.google.common.collect.ImmutableList;
+import com.google.errorprone.annotations.CanIgnoreReturnValue;
 import java.nio.ByteBuffer;
 import java.util.List;
+import java.util.PriorityQueue;
 import org.checkerframework.checker.initialization.qual.Initialized;
 import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
 import org.checkerframework.checker.nullness.qual.RequiresNonNull;
@@ -155,6 +158,14 @@ public class MediaCodecVideoRenderer extends MediaCodecRenderer
   private final boolean deviceNeedsNoPostProcessWorkaround;
   private final VideoFrameReleaseControl videoFrameReleaseControl;
   private final VideoFrameReleaseControl.FrameReleaseInfo videoFrameReleaseInfo;
+  @Nullable private final Av1SampleDependencyParser av1SampleDependencyParser;
+
+  /**
+   * The earliest time threshold, in microseconds, after which decoder input buffers may be dropped.
+   */
+  private final long minEarlyUsToDropDecoderInput;
+
+  private final PriorityQueue<Long> droppedDecoderInputBufferTimestamps;
 
   private @MonotonicNonNull CodecMaxValues codecMaxValues;
   private boolean codecNeedsSetOutputSurfaceWorkaround;
@@ -187,42 +198,204 @@ public class MediaCodecVideoRenderer extends MediaCodecRenderer
   private long periodDurationUs;
   private boolean pendingVideoSinkInputStreamChange;
 
-  /**
-   * @param context A context.
-   * @param mediaCodecSelector A decoder selector.
-   */
-  public MediaCodecVideoRenderer(Context context, MediaCodecSelector mediaCodecSelector) {
-    this(context, mediaCodecSelector, 0);
+  private boolean shouldDropDecoderInputBuffers;
+
+  /** A builder to create {@link MediaCodecVideoRenderer} instances. */
+  public static final class Builder {
+    private final Context context;
+    private boolean buildCalled;
+    private MediaCodecSelector mediaCodecSelector;
+    private MediaCodecAdapter.Factory codecAdapterFactory;
+    private long allowedJoiningTimeMs;
+    private boolean enableDecoderFallback;
+    @Nullable private Handler eventHandler;
+    @Nullable private VideoRendererEventListener eventListener;
+    private int maxDroppedFramesToNotify;
+    private float assumedMinimumCodecOperatingRate;
+    @Nullable private VideoSink videoSink;
+    private boolean parseAv1SampleDependencies;
+    private long lateThresholdToDropDecoderInputUs;
+
+    /**
+     * Creates a new builder.
+     *
+     * @param context A context.
+     */
+    public Builder(Context context) {
+      this.context = context;
+      this.mediaCodecSelector = MediaCodecSelector.DEFAULT;
+      this.codecAdapterFactory = MediaCodecAdapter.Factory.getDefault(context);
+      this.assumedMinimumCodecOperatingRate = 30;
+      this.lateThresholdToDropDecoderInputUs = C.TIME_UNSET;
+    }
+
+    /** Sets the {@link MediaCodecSelector decoder selector}. */
+    @CanIgnoreReturnValue
+    public Builder setMediaCodecSelector(MediaCodecSelector mediaCodecSelector) {
+      this.mediaCodecSelector = mediaCodecSelector;
+      return this;
+    }
+
+    /**
+     * Sets the {@link MediaCodecAdapter.Factory} used to create {@link MediaCodecAdapter}
+     * instances.
+     */
+    @CanIgnoreReturnValue
+    public Builder setCodecAdapterFactory(MediaCodecAdapter.Factory codecAdapterFactory) {
+      this.codecAdapterFactory = codecAdapterFactory;
+      return this;
+    }
+
+    /**
+     * Sets the maximum duration in milliseconds for which this video renderer can attempt to
+     * seamlessly join an ongoing playback.
+     */
+    @CanIgnoreReturnValue
+    public Builder setAllowedJoiningTimeMs(long allowedJoiningTimeMs) {
+      this.allowedJoiningTimeMs = allowedJoiningTimeMs;
+      return this;
+    }
+
+    /**
+     * Sets whether to enable fallback to lower-priority decoders if decoder initialization fails.
+     * This may result in using a decoder that is slower/less efficient than the primary decoder.
+     */
+    @CanIgnoreReturnValue
+    public Builder setEnableDecoderFallback(boolean enableDecoderFallback) {
+      this.enableDecoderFallback = enableDecoderFallback;
+      return this;
+    }
+
+    /**
+     * Sets a handler to use when delivering events to {@code eventListener}.
+     *
+     * <p>The {@link #setEventHandler event handler} and {@link #setEventListener event listener}
+     * are linked in that both should be set to either {@code null} or non-{@code null} values.
+     */
+    @CanIgnoreReturnValue
+    public Builder setEventHandler(@Nullable Handler eventHandler) {
+      this.eventHandler = eventHandler;
+      return this;
+    }
+
+    /**
+     * Sets a listener for {@link VideoRendererEventListener} events.
+     *
+     * <p>The {@link #setEventHandler event handler} and {@link #setEventListener event listener}
+     * are linked in that both should be set to either {@code null} or non-{@code null} values.
+     */
+    @CanIgnoreReturnValue
+    public Builder setEventListener(@Nullable VideoRendererEventListener eventListener) {
+      this.eventListener = eventListener;
+      return this;
+    }
+
+    /**
+     * Sets the maximum number of frames that can be dropped between invocations of {@link
+     * VideoRendererEventListener#onDroppedFrames(int, long)}.
+     */
+    @CanIgnoreReturnValue
+    public Builder setMaxDroppedFramesToNotify(int maxDroppedFramesToNotify) {
+      this.maxDroppedFramesToNotify = maxDroppedFramesToNotify;
+      return this;
+    }
+
+    /**
+     * Sets a codec operating rate that all codecs instantiated by this renderer are assumed to meet
+     * implicitly (i.e. without the operating rate being set explicitly using {@link
+     * MediaFormat#KEY_OPERATING_RATE}).
+     */
+    @CanIgnoreReturnValue
+    public Builder setAssumedMinimumCodecOperatingRate(float assumedMinimumCodecOperatingRate) {
+      this.assumedMinimumCodecOperatingRate = assumedMinimumCodecOperatingRate;
+      return this;
+    }
+
+    /**
+     * Sets a {@link VideoSink} to consume the frames.
+     *
+     * <p>If a {@link VideoSink} is not set and effects are {@linkplain #MSG_SET_VIDEO_EFFECTS set},
+     * a {@link VideoSink} produced by a {@link PlaybackVideoGraphWrapper} with its default
+     * configuration will be used to apply effects and render the frames on the output.
+     */
+    @CanIgnoreReturnValue
+    public Builder setVideoSink(@Nullable VideoSink videoSink) {
+      this.videoSink = videoSink;
+      return this;
+    }
+
+    /**
+     * Sets whether {@link MimeTypes#VIDEO_AV1} bitstream parsing for sample dependency information
+     * is enabled. Knowing which input frames are not depended on can speed up seeking and reduce
+     * dropped frames.
+     *
+     * <p>Defaults to {@code false}.
+     *
+     * <p>This method is experimental and will be renamed or removed in a future release.
+     */
+    @CanIgnoreReturnValue
+    public Builder experimentalSetParseAv1SampleDependencies(boolean parseAv1SampleDependencies) {
+      this.parseAv1SampleDependencies = parseAv1SampleDependencies;
+      return this;
+    }
+
+    /**
+     * Sets the late threshold for rendered output buffers, in microseconds, after which decoder
+     * input buffers may be dropped.
+     *
+     * <p>The default value is {@link C#TIME_UNSET} and therefore no input buffers will be dropped
+     * due to this logic.
+     *
+     * <p>This method is experimental and will be renamed or removed in a future release.
+     */
+    @CanIgnoreReturnValue
+    public Builder experimentalSetLateThresholdToDropDecoderInputUs(
+        long lateThresholdToDropDecoderInputUs) {
+      this.lateThresholdToDropDecoderInputUs = lateThresholdToDropDecoderInputUs;
+      return this;
+    }
+
+    /**
+     * Builds the {@link MediaCodecVideoRenderer}. Must only be called once per Builder instance.
+     *
+     * <p>Throws {@link IllegalStateException} if the {@link #setEventHandler event handler} and the
+     * {@link #setEventListener event listener} are neither both {@code null} nor both non-{@code
+     * null}.
+     */
+    public MediaCodecVideoRenderer build() {
+      checkState(!buildCalled);
+      checkState(
+          (eventHandler == null && eventListener == null)
+              || (eventHandler != null && eventListener != null));
+      buildCalled = true;
+      return new MediaCodecVideoRenderer(this);
+    }
   }
 
   /**
-   * @param context A context.
-   * @param mediaCodecSelector A decoder selector.
-   * @param allowedJoiningTimeMs The maximum duration in milliseconds for which this video renderer
-   *     can attempt to seamlessly join an ongoing playback.
+   * @deprecated Use {@link Builder} instead.
    */
+  @Deprecated
+  public MediaCodecVideoRenderer(Context context, MediaCodecSelector mediaCodecSelector) {
+    this(new Builder(context).setMediaCodecSelector(mediaCodecSelector));
+  }
+
+  /**
+   * @deprecated Use {@link Builder} instead.
+   */
+  @Deprecated
   public MediaCodecVideoRenderer(
       Context context, MediaCodecSelector mediaCodecSelector, long allowedJoiningTimeMs) {
     this(
-        context,
-        mediaCodecSelector,
-        allowedJoiningTimeMs,
-        /* eventHandler= */ null,
-        /* eventListener= */ null,
-        /* maxDroppedFramesToNotify= */ 0);
+        new Builder(context)
+            .setMediaCodecSelector(mediaCodecSelector)
+            .setAllowedJoiningTimeMs(allowedJoiningTimeMs));
   }
 
   /**
-   * @param context A context.
-   * @param mediaCodecSelector A decoder selector.
-   * @param allowedJoiningTimeMs The maximum duration in milliseconds for which this video renderer
-   *     can attempt to seamlessly join an ongoing playback.
-   * @param eventHandler A handler to use when delivering events to {@code eventListener}. May be
-   *     null if delivery of events is not required.
-   * @param eventListener A listener of events. May be null if delivery of events is not required.
-   * @param maxDroppedFramesToNotify The maximum number of frames that can be dropped between
-   *     invocations of {@link VideoRendererEventListener#onDroppedFrames(int, long)}.
+   * @deprecated Use {@link Builder} instead.
    */
+  @Deprecated
   public MediaCodecVideoRenderer(
       Context context,
       MediaCodecSelector mediaCodecSelector,
@@ -231,31 +404,18 @@ public class MediaCodecVideoRenderer extends MediaCodecRenderer
       @Nullable VideoRendererEventListener eventListener,
       int maxDroppedFramesToNotify) {
     this(
-        context,
-        MediaCodecAdapter.Factory.getDefault(context),
-        mediaCodecSelector,
-        allowedJoiningTimeMs,
-        /* enableDecoderFallback= */ false,
-        eventHandler,
-        eventListener,
-        maxDroppedFramesToNotify,
-        /* assumedMinimumCodecOperatingRate= */ 30);
+        new Builder(context)
+            .setMediaCodecSelector(mediaCodecSelector)
+            .setAllowedJoiningTimeMs(allowedJoiningTimeMs)
+            .setEventHandler(eventHandler)
+            .setEventListener(eventListener)
+            .setMaxDroppedFramesToNotify(maxDroppedFramesToNotify));
   }
 
   /**
-   * @param context A context.
-   * @param mediaCodecSelector A decoder selector.
-   * @param allowedJoiningTimeMs The maximum duration in milliseconds for which this video renderer
-   *     can attempt to seamlessly join an ongoing playback.
-   * @param enableDecoderFallback Whether to enable fallback to lower-priority decoders if decoder
-   *     initialization fails. This may result in using a decoder that is slower/less efficient than
-   *     the primary decoder.
-   * @param eventHandler A handler to use when delivering events to {@code eventListener}. May be
-   *     null if delivery of events is not required.
-   * @param eventListener A listener of events. May be null if delivery of events is not required.
-   * @param maxDroppedFramesToNotify The maximum number of frames that can be dropped between
-   *     invocations of {@link VideoRendererEventListener#onDroppedFrames(int, long)}.
+   * @deprecated Use {@link Builder} instead.
    */
+  @Deprecated
   public MediaCodecVideoRenderer(
       Context context,
       MediaCodecSelector mediaCodecSelector,
@@ -265,33 +425,19 @@ public class MediaCodecVideoRenderer extends MediaCodecRenderer
       @Nullable VideoRendererEventListener eventListener,
       int maxDroppedFramesToNotify) {
     this(
-        context,
-        MediaCodecAdapter.Factory.getDefault(context),
-        mediaCodecSelector,
-        allowedJoiningTimeMs,
-        enableDecoderFallback,
-        eventHandler,
-        eventListener,
-        maxDroppedFramesToNotify,
-        /* assumedMinimumCodecOperatingRate= */ 30);
+        new Builder(context)
+            .setMediaCodecSelector(mediaCodecSelector)
+            .setAllowedJoiningTimeMs(allowedJoiningTimeMs)
+            .setEnableDecoderFallback(enableDecoderFallback)
+            .setEventHandler(eventHandler)
+            .setEventListener(eventListener)
+            .setMaxDroppedFramesToNotify(maxDroppedFramesToNotify));
   }
 
   /**
-   * @param context A context.
-   * @param codecAdapterFactory The {@link MediaCodecAdapter.Factory} used to create {@link
-   *     MediaCodecAdapter} instances.
-   * @param mediaCodecSelector A decoder selector.
-   * @param allowedJoiningTimeMs The maximum duration in milliseconds for which this video renderer
-   *     can attempt to seamlessly join an ongoing playback.
-   * @param enableDecoderFallback Whether to enable fallback to lower-priority decoders if decoder
-   *     initialization fails. This may result in using a decoder that is slower/less efficient than
-   *     the primary decoder.
-   * @param eventHandler A handler to use when delivering events to {@code eventListener}. May be
-   *     null if delivery of events is not required.
-   * @param eventListener A listener of events. May be null if delivery of events is not required.
-   * @param maxDroppedFramesToNotify The maximum number of frames that can be dropped between
-   *     invocations of {@link VideoRendererEventListener#onDroppedFrames(int, long)}.
+   * @deprecated Use {@link Builder} instead.
    */
+  @Deprecated
   public MediaCodecVideoRenderer(
       Context context,
       MediaCodecAdapter.Factory codecAdapterFactory,
@@ -302,38 +448,20 @@ public class MediaCodecVideoRenderer extends MediaCodecRenderer
       @Nullable VideoRendererEventListener eventListener,
       int maxDroppedFramesToNotify) {
     this(
-        context,
-        codecAdapterFactory,
-        mediaCodecSelector,
-        allowedJoiningTimeMs,
-        enableDecoderFallback,
-        eventHandler,
-        eventListener,
-        maxDroppedFramesToNotify,
-        /* assumedMinimumCodecOperatingRate= */ 30);
+        new Builder(context)
+            .setMediaCodecSelector(mediaCodecSelector)
+            .setCodecAdapterFactory(codecAdapterFactory)
+            .setAllowedJoiningTimeMs(allowedJoiningTimeMs)
+            .setEnableDecoderFallback(enableDecoderFallback)
+            .setEventHandler(eventHandler)
+            .setEventListener(eventListener)
+            .setMaxDroppedFramesToNotify(maxDroppedFramesToNotify));
   }
 
   /**
-   * Creates a new instance.
-   *
-   * @param context A context.
-   * @param codecAdapterFactory The {@link MediaCodecAdapter.Factory} used to create {@link
-   *     MediaCodecAdapter} instances.
-   * @param mediaCodecSelector A decoder selector.
-   * @param allowedJoiningTimeMs The maximum duration in milliseconds for which this video renderer
-   *     can attempt to seamlessly join an ongoing playback.
-   * @param enableDecoderFallback Whether to enable fallback to lower-priority decoders if decoder
-   *     initialization fails. This may result in using a decoder that is slower/less efficient than
-   *     the primary decoder.
-   * @param eventHandler A handler to use when delivering events to {@code eventListener}. May be
-   *     null if delivery of events is not required.
-   * @param eventListener A listener of events. May be null if delivery of events is not required.
-   * @param maxDroppedFramesToNotify The maximum number of frames that can be dropped between
-   *     invocations of {@link VideoRendererEventListener#onDroppedFrames(int, long)}.
-   * @param assumedMinimumCodecOperatingRate A codec operating rate that all codecs instantiated by
-   *     this renderer are assumed to meet implicitly (i.e. without the operating rate being set
-   *     explicitly using {@link MediaFormat#KEY_OPERATING_RATE}).
+   * @deprecated Use {@link Builder} instead.
    */
+  @Deprecated
   public MediaCodecVideoRenderer(
       Context context,
       MediaCodecAdapter.Factory codecAdapterFactory,
@@ -345,22 +473,19 @@ public class MediaCodecVideoRenderer extends MediaCodecRenderer
       int maxDroppedFramesToNotify,
       float assumedMinimumCodecOperatingRate) {
     this(
-        context,
-        codecAdapterFactory,
-        mediaCodecSelector,
-        allowedJoiningTimeMs,
-        enableDecoderFallback,
-        eventHandler,
-        eventListener,
-        maxDroppedFramesToNotify,
-        assumedMinimumCodecOperatingRate,
-        /* videoSink= */ (VideoSink) null);
+        new Builder(context)
+            .setMediaCodecSelector(mediaCodecSelector)
+            .setCodecAdapterFactory(codecAdapterFactory)
+            .setAllowedJoiningTimeMs(allowedJoiningTimeMs)
+            .setEnableDecoderFallback(enableDecoderFallback)
+            .setEventHandler(eventHandler)
+            .setEventListener(eventListener)
+            .setMaxDroppedFramesToNotify(maxDroppedFramesToNotify)
+            .setAssumedMinimumCodecOperatingRate(assumedMinimumCodecOperatingRate));
   }
 
   /**
-   * @deprecated Use {@link #MediaCodecVideoRenderer(Context, MediaCodecAdapter.Factory,
-   *     MediaCodecSelector, long, boolean, Handler, VideoRendererEventListener, int, float,
-   *     VideoSink)} instead.
+   * @deprecated Use {@link Builder} instead.
    */
   @Deprecated
   public MediaCodecVideoRenderer(
@@ -375,45 +500,23 @@ public class MediaCodecVideoRenderer extends MediaCodecRenderer
       float assumedMinimumCodecOperatingRate,
       @Nullable VideoSinkProvider videoSinkProvider) {
     this(
-        context,
-        codecAdapterFactory,
-        mediaCodecSelector,
-        allowedJoiningTimeMs,
-        enableDecoderFallback,
-        eventHandler,
-        eventListener,
-        maxDroppedFramesToNotify,
-        assumedMinimumCodecOperatingRate,
-        /* videoSink= */ videoSinkProvider == null
-            ? null
-            : videoSinkProvider.getSink(/* inputIndex= */ 0));
+        new Builder(context)
+            .setMediaCodecSelector(mediaCodecSelector)
+            .setCodecAdapterFactory(codecAdapterFactory)
+            .setAllowedJoiningTimeMs(allowedJoiningTimeMs)
+            .setEnableDecoderFallback(enableDecoderFallback)
+            .setEventHandler(eventHandler)
+            .setEventListener(eventListener)
+            .setMaxDroppedFramesToNotify(maxDroppedFramesToNotify)
+            .setAssumedMinimumCodecOperatingRate(assumedMinimumCodecOperatingRate)
+            .setVideoSink(
+                videoSinkProvider == null ? null : videoSinkProvider.getSink(/* inputIndex= */ 0)));
   }
 
   /**
-   * Creates a new instance.
-   *
-   * @param context A context.
-   * @param codecAdapterFactory The {@link MediaCodecAdapter.Factory} used to create {@link
-   *     MediaCodecAdapter} instances.
-   * @param mediaCodecSelector A decoder selector.
-   * @param allowedJoiningTimeMs The maximum duration in milliseconds for which this video renderer
-   *     can attempt to seamlessly join an ongoing playback.
-   * @param enableDecoderFallback Whether to enable fallback to lower-priority decoders if decoder
-   *     initialization fails. This may result in using a decoder that is slower/less efficient than
-   *     the primary decoder.
-   * @param eventHandler A handler to use when delivering events to {@code eventListener}. May be
-   *     null if delivery of events is not required.
-   * @param eventListener A listener of events. May be null if delivery of events is not required.
-   * @param maxDroppedFramesToNotify The maximum number of frames that can be dropped between
-   *     invocations of {@link VideoRendererEventListener#onDroppedFrames(int, long)}.
-   * @param assumedMinimumCodecOperatingRate A codec operating rate that all codecs instantiated by
-   *     this renderer are assumed to meet implicitly (i.e. without the operating rate being set
-   *     explicitly using {@link MediaFormat#KEY_OPERATING_RATE}).
-   * @param videoSink The {@link VideoSink} consuming the frames. If {@code null} and effects are
-   *     {@linkplain #MSG_SET_VIDEO_EFFECTS set}, a {@link VideoSink} produced by a {@link
-   *     PlaybackVideoGraphWrapper} with its default configuration will be used to apply effects and
-   *     render the frames on the output.
+   * @deprecated Use {@link Builder} instead.
    */
+  @Deprecated
   public MediaCodecVideoRenderer(
       Context context,
       MediaCodecAdapter.Factory codecAdapterFactory,
@@ -425,22 +528,39 @@ public class MediaCodecVideoRenderer extends MediaCodecRenderer
       int maxDroppedFramesToNotify,
       float assumedMinimumCodecOperatingRate,
       @Nullable VideoSink videoSink) {
+    this(
+        new Builder(context)
+            .setMediaCodecSelector(mediaCodecSelector)
+            .setCodecAdapterFactory(codecAdapterFactory)
+            .setAllowedJoiningTimeMs(allowedJoiningTimeMs)
+            .setEnableDecoderFallback(enableDecoderFallback)
+            .setEventHandler(eventHandler)
+            .setEventListener(eventListener)
+            .setMaxDroppedFramesToNotify(maxDroppedFramesToNotify)
+            .setAssumedMinimumCodecOperatingRate(assumedMinimumCodecOperatingRate)
+            .setVideoSink(videoSink));
+  }
+
+  /**
+   * @param builder The {@link Builder} containing construction parameters.
+   */
+  protected MediaCodecVideoRenderer(Builder builder) {
     super(
         C.TRACK_TYPE_VIDEO,
-        codecAdapterFactory,
-        mediaCodecSelector,
-        enableDecoderFallback,
-        assumedMinimumCodecOperatingRate);
-    this.context = context.getApplicationContext();
-    this.maxDroppedFramesToNotify = maxDroppedFramesToNotify;
-    this.videoSink = videoSink;
-    eventDispatcher = new EventDispatcher(eventHandler, eventListener);
+        builder.codecAdapterFactory,
+        builder.mediaCodecSelector,
+        builder.enableDecoderFallback,
+        builder.assumedMinimumCodecOperatingRate);
+    this.context = builder.context.getApplicationContext();
+    this.maxDroppedFramesToNotify = builder.maxDroppedFramesToNotify;
+    this.videoSink = builder.videoSink;
+    eventDispatcher = new EventDispatcher(builder.eventHandler, builder.eventListener);
     ownsVideoSink = videoSink == null;
     @SuppressWarnings("nullness:assignment")
     VideoFrameReleaseControl.@Initialized FrameTimingEvaluator thisRef = this;
     videoFrameReleaseControl =
         new VideoFrameReleaseControl(
-            this.context, /* frameTimingEvaluator= */ thisRef, allowedJoiningTimeMs);
+            this.context, /* frameTimingEvaluator= */ thisRef, builder.allowedJoiningTimeMs);
     videoFrameReleaseInfo = new VideoFrameReleaseControl.FrameReleaseInfo();
     deviceNeedsNoPostProcessWorkaround = deviceNeedsNoPostProcessWorkaround();
     outputResolution = Size.UNKNOWN;
@@ -452,6 +572,13 @@ public class MediaCodecVideoRenderer extends MediaCodecRenderer
     rendererPriority = C.PRIORITY_PLAYBACK;
     startPositionUs = C.TIME_UNSET;
     periodDurationUs = C.TIME_UNSET;
+    av1SampleDependencyParser =
+        builder.parseAv1SampleDependencies ? new Av1SampleDependencyParser() : null;
+    droppedDecoderInputBufferTimestamps = new PriorityQueue<>();
+    minEarlyUsToDropDecoderInput =
+        builder.lateThresholdToDropDecoderInputUs != C.TIME_UNSET
+            ? -builder.lateThresholdToDropDecoderInputUs
+            : C.TIME_UNSET;
   }
 
   // FrameTimingEvaluator methods
@@ -474,6 +601,9 @@ public class MediaCodecVideoRenderer extends MediaCodecRenderer
       boolean isLastFrame,
       boolean treatDroppedBuffersAsSkipped)
       throws ExoPlaybackException {
+    if (minEarlyUsToDropDecoderInput != C.TIME_UNSET) {
+      shouldDropDecoderInputBuffers = earlyUs < minEarlyUsToDropDecoderInput;
+    }
     return shouldDropBuffersToKeyframe(earlyUs, elapsedRealtimeUs, isLastFrame)
         && maybeDropBuffersToKeyframe(positionUs, treatDroppedBuffersAsSkipped);
   }
@@ -814,9 +944,7 @@ public class MediaCodecVideoRenderer extends MediaCodecRenderer
         videoSink.flush(/* resetPosition= */ true);
       }
       videoSink.setStreamTimestampInfo(
-          getOutputStreamStartPositionUs(),
-          getBufferTimestampAdjustmentUs(),
-          getLastResetPositionUs());
+          getOutputStreamStartPositionUs(), getBufferTimestampAdjustmentUs());
       pendingVideoSinkInputStreamChange = true;
     }
     super.onPositionReset(positionUs, joining);
@@ -1123,7 +1251,12 @@ public class MediaCodecVideoRenderer extends MediaCodecRenderer
   @Override
   protected void resetCodecStateForFlush() {
     super.resetCodecStateForFlush();
+    droppedDecoderInputBufferTimestamps.clear();
+    shouldDropDecoderInputBuffers = false;
     buffersInCodecCount = 0;
+    if (av1SampleDependencyParser != null) {
+      av1SampleDependencyParser.reset();
+    }
   }
 
   @Override
@@ -1191,10 +1324,10 @@ public class MediaCodecVideoRenderer extends MediaCodecRenderer
             HEVC_MAX_INPUT_SIZE_THRESHOLD,
             getMaxSampleSize(/* pixelCount= */ width * height, /* minCompressionRatio= */ 2));
       case MimeTypes.VIDEO_H264:
-        if ("BRAVIA 4K 2015".equals(Util.MODEL) // Sony Bravia 4K
-            || ("Amazon".equals(Util.MANUFACTURER)
-                && ("KFSOWI".equals(Util.MODEL) // Kindle Soho
-                    || ("AFTS".equals(Util.MODEL) && codecInfo.secure)))) { // Fire TV Gen 2
+        if ("BRAVIA 4K 2015".equals(Build.MODEL) // Sony Bravia 4K
+            || ("Amazon".equals(Build.MANUFACTURER)
+                && ("KFSOWI".equals(Build.MODEL) // Kindle Soho
+                    || ("AFTS".equals(Build.MODEL) && codecInfo.secure)))) { // Fire TV Gen 2
           // Use the default value for cases where platform limitations may prevent buffers of the
           // calculated maximum input size from being allocated.
           return Format.NO_VALUE;
@@ -1298,6 +1431,11 @@ public class MediaCodecVideoRenderer extends MediaCodecRenderer
   @CallSuper
   @Override
   protected void onQueueInputBuffer(DecoderInputBuffer buffer) throws ExoPlaybackException {
+    if (av1SampleDependencyParser != null
+        && checkNotNull(getCodecInfo()).mimeType.equals(MimeTypes.VIDEO_AV1)
+        && buffer.data != null) {
+      av1SampleDependencyParser.queueInputBuffer(buffer.data);
+    }
     // In tunneling mode the device may do frame rate conversion, so in general we can't keep track
     // of the number of buffers in the codec.
     if (!tunneling) {
@@ -1323,11 +1461,7 @@ public class MediaCodecVideoRenderer extends MediaCodecRenderer
   }
 
   @Override
-  protected boolean shouldSkipDecoderInputBuffer(DecoderInputBuffer buffer) {
-    if (!buffer.notDependedOn()) {
-      // Buffer is depended on. Do not skip.
-      return false;
-    }
+  protected boolean shouldDiscardDecoderInputBuffer(DecoderInputBuffer buffer) {
     if (isBufferProbablyLastSample(buffer)) {
       // Make sure to decode and render the last frame.
       return false;
@@ -1337,8 +1471,45 @@ public class MediaCodecVideoRenderer extends MediaCodecRenderer
       // block processed. Skipping input buffers before the decoder is not allowed.
       return false;
     }
-    // Skip buffers without sample dependencies that won't be rendered.
-    return isBufferBeforeStartTime(buffer);
+    boolean shouldSkipDecoderInputBuffer = isBufferBeforeStartTime(buffer);
+    if (!shouldSkipDecoderInputBuffer && !shouldDropDecoderInputBuffers) {
+      return false;
+    }
+    if (buffer.hasSupplementalData()) {
+      return false;
+    }
+    if (buffer.notDependedOn()) {
+      buffer.clear();
+      if (shouldSkipDecoderInputBuffer) {
+        decoderCounters.skippedInputBufferCount += 1;
+      } else if (shouldDropDecoderInputBuffers) {
+        droppedDecoderInputBufferTimestamps.add(buffer.timeUs);
+      }
+      return true;
+    }
+    if (av1SampleDependencyParser != null
+        && checkNotNull(getCodecInfo()).mimeType.equals(MimeTypes.VIDEO_AV1)
+        && buffer.data != null) {
+      ByteBuffer readOnlySample = buffer.data.asReadOnlyBuffer();
+      readOnlySample.flip();
+      int sampleLimitAfterSkippingNonReferenceFrames =
+          av1SampleDependencyParser.sampleLimitAfterSkippingNonReferenceFrame(readOnlySample);
+      boolean hasSpaceForNextFrame =
+          sampleLimitAfterSkippingNonReferenceFrames + checkNotNull(codecMaxValues).inputSize
+              < readOnlySample.capacity();
+      if (sampleLimitAfterSkippingNonReferenceFrames != readOnlySample.limit()
+          && hasSpaceForNextFrame) {
+        checkNotNull(buffer.data).position(sampleLimitAfterSkippingNonReferenceFrames);
+        if (shouldSkipDecoderInputBuffer) {
+          decoderCounters.skippedInputBufferCount += 1;
+        } else if (shouldDropDecoderInputBuffers) {
+          droppedDecoderInputBufferTimestamps.add(buffer.timeUs);
+        }
+        return true;
+      }
+      return false;
+    }
+    return false;
   }
 
   private boolean isBufferProbablyLastSample(DecoderInputBuffer buffer) {
@@ -1478,8 +1649,14 @@ public class MediaCodecVideoRenderer extends MediaCodecRenderer
 
     long outputStreamOffsetUs = getOutputStreamOffsetUs();
     long presentationTimeUs = bufferPresentationTimeUs - outputStreamOffsetUs;
+    updateDroppedBufferCountersWithInputBuffers(bufferPresentationTimeUs);
 
     if (videoSink != null) {
+      // Skip decode-only buffers, e.g. after seeking, immediately.
+      if (isDecodeOnlyBuffer && !isLastBuffer) {
+        skipOutputBuffer(codec, bufferIndex, presentationTimeUs);
+        return true;
+      }
       long framePresentationTimeUs = bufferPresentationTimeUs + getBufferTimestampAdjustmentUs();
       return videoSink.handleInputFrame(
           framePresentationTimeUs,
@@ -1631,9 +1808,7 @@ public class MediaCodecVideoRenderer extends MediaCodecRenderer
       // Signaling end of the previous stream.
       videoSink.signalEndOfCurrentInputStream();
       videoSink.setStreamTimestampInfo(
-          getOutputStreamStartPositionUs(),
-          getBufferTimestampAdjustmentUs(),
-          getLastResetPositionUs());
+          getOutputStreamStartPositionUs(), getBufferTimestampAdjustmentUs());
     } else {
       videoFrameReleaseControl.onProcessedStreamChange();
     }
@@ -1747,10 +1922,13 @@ public class MediaCodecVideoRenderer extends MediaCodecRenderer
     if (treatDroppedBuffersAsSkipped) {
       decoderCounters.skippedInputBufferCount += droppedSourceBufferCount;
       decoderCounters.skippedOutputBufferCount += buffersInCodecCount;
+      decoderCounters.skippedInputBufferCount += droppedDecoderInputBufferTimestamps.size();
     } else {
       decoderCounters.droppedToKeyframeCount++;
       updateDroppedBufferCounters(
-          droppedSourceBufferCount, /* droppedDecoderBufferCount= */ buffersInCodecCount);
+          /* droppedInputBufferCount= */ droppedSourceBufferCount
+              + droppedDecoderInputBufferTimestamps.size(),
+          /* droppedDecoderBufferCount= */ buffersInCodecCount);
     }
     flushOrReinitializeCodec();
     if (videoSink != null) {
@@ -1779,6 +1957,23 @@ public class MediaCodecVideoRenderer extends MediaCodecRenderer
     if (maxDroppedFramesToNotify > 0 && droppedFrames >= maxDroppedFramesToNotify) {
       maybeNotifyDroppedFrames();
     }
+  }
+
+  /**
+   * Updates counters to reflect dropped input buffers prior to {@code bufferPresentationTimeUs}.
+   *
+   * @param bufferPresentationTimeUs The presentation timestamp of the last processed output buffer,
+   *     in microseconds.
+   */
+  private void updateDroppedBufferCountersWithInputBuffers(long bufferPresentationTimeUs) {
+    int droppedInputBufferCount = 0;
+    Long minDroppedDecoderBufferTimeUs;
+    while ((minDroppedDecoderBufferTimeUs = droppedDecoderInputBufferTimestamps.peek()) != null
+        && minDroppedDecoderBufferTimeUs < bufferPresentationTimeUs) {
+      droppedInputBufferCount++;
+      droppedDecoderInputBufferTimestamps.poll();
+    }
+    updateDroppedBufferCounters(droppedInputBufferCount, /* droppedDecoderBufferCount= */ 0);
   }
 
   /**
@@ -1881,7 +2076,7 @@ public class MediaCodecVideoRenderer extends MediaCodecRenderer
     return Util.SDK_INT >= 35 && codecInfo.detachedSurfaceSupported;
   }
 
-  private boolean shouldUsePlaceholderSurface(MediaCodecInfo codecInfo) {
+  protected boolean shouldUsePlaceholderSurface(MediaCodecInfo codecInfo) {
     return Util.SDK_INT >= 23
         && !tunneling
         && !codecNeedsSetOutputSurfaceWorkaround(codecInfo.name)
@@ -2218,7 +2413,7 @@ public class MediaCodecVideoRenderer extends MediaCodecRenderer
     // also lose sync [Internal: b/26453592]. Even after M, the devices may apply post processing
     // operations that can modify frame output timestamps, which is incompatible with ExoPlayer's
     // logic for skipping decode-only frames.
-    return "NVIDIA".equals(Util.MANUFACTURER);
+    return "NVIDIA".equals(Build.MANUFACTURER);
   }
 
   /*
@@ -2296,7 +2491,7 @@ public class MediaCodecVideoRenderer extends MediaCodecRenderer
       // https://github.com/google/ExoPlayer/issues/8014.
       // https://github.com/google/ExoPlayer/issues/8329.
       // https://github.com/google/ExoPlayer/issues/9710.
-      switch (Util.DEVICE) {
+      switch (Build.DEVICE) {
         case "aquaman":
         case "dangal":
         case "dangalUHD":
@@ -2310,12 +2505,12 @@ public class MediaCodecVideoRenderer extends MediaCodecRenderer
           break; // Do nothing.
       }
     }
-    if (Util.SDK_INT <= 27 && "HWEML".equals(Util.DEVICE)) {
+    if (Util.SDK_INT <= 27 && "HWEML".equals(Build.DEVICE)) {
       // Workaround for Huawei P20:
       // https://github.com/google/ExoPlayer/issues/4468#issuecomment-459291645.
       return true;
     }
-    switch (Util.MODEL) {
+    switch (Build.MODEL) {
       // Workaround for some Fire OS devices.
       case "AFTA":
       case "AFTN":
@@ -2350,7 +2545,7 @@ public class MediaCodecVideoRenderer extends MediaCodecRenderer
       // https://github.com/google/ExoPlayer/issues/6503.
       // https://github.com/google/ExoPlayer/issues/8014,
       // https://github.com/google/ExoPlayer/pull/8030.
-      switch (Util.DEVICE) {
+      switch (Build.DEVICE) {
         case "1601":
         case "1713":
         case "1714":
@@ -2495,7 +2690,7 @@ public class MediaCodecVideoRenderer extends MediaCodecRenderer
         default:
           break; // Do nothing.
       }
-      switch (Util.MODEL) {
+      switch (Build.MODEL) {
         case "JSN-L21":
           return true;
         default:

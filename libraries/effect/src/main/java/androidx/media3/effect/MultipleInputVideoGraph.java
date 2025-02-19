@@ -49,7 +49,6 @@ import androidx.media3.common.VideoCompositorSettings;
 import androidx.media3.common.VideoFrameProcessingException;
 import androidx.media3.common.VideoFrameProcessor;
 import androidx.media3.common.VideoGraph;
-import androidx.media3.common.util.GlUtil;
 import androidx.media3.common.util.GlUtil.GlException;
 import androidx.media3.common.util.Log;
 import androidx.media3.common.util.UnstableApi;
@@ -60,6 +59,7 @@ import java.util.List;
 import java.util.Queue;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Future;
 import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
 
 /** A {@link VideoGraph} that handles multiple input streams. */
@@ -76,7 +76,7 @@ public abstract class MultipleInputVideoGraph implements VideoGraph {
   private final Context context;
 
   private final ColorInfo outputColorInfo;
-  private final SingleContextGlObjectsProvider glObjectsProvider;
+  private final GlObjectsProvider glObjectsProvider;
   private final DebugViewProvider debugViewProvider;
   private final VideoGraph.Listener listener;
   private final Executor listenerExecutor;
@@ -306,21 +306,22 @@ public abstract class MultipleInputVideoGraph implements VideoGraph {
       compositionVideoFrameProcessor = null;
     }
 
-    try {
-      // The eglContext is not released by any of the frame processors.
-      if (glObjectsProvider.singleEglContext != null) {
-        destroyEglContext(getDefaultEglDisplay(), glObjectsProvider.singleEglContext);
-      }
-    } catch (GlUtil.GlException e) {
-      Log.e(TAG, "Error releasing GL context", e);
-    }
+    Future<?> unused =
+        sharedExecutorService.submit(
+            () -> {
+              try {
+                glObjectsProvider.release(getDefaultEglDisplay());
+              } catch (Exception e) {
+                Log.e(TAG, "Error releasing GlObjectsProvider", e);
+              }
+            });
 
     sharedExecutorService.shutdown();
     try {
       sharedExecutorService.awaitTermination(RELEASE_WAIT_TIME_MS, MILLISECONDS);
     } catch (InterruptedException e) {
       Thread.currentThread().interrupt();
-      listenerExecutor.execute(() -> listener.onError(VideoFrameProcessingException.from(e)));
+      Log.e(TAG, "Thread interrupted while waiting for executor service termination");
     }
 
     released = true;
@@ -516,8 +517,10 @@ public abstract class MultipleInputVideoGraph implements VideoGraph {
     }
 
     @Override
-    public void release(EGLDisplay eglDisplay) {
-      // The eglContext is released in the VideoGraph after all VideoFrameProcessors are released.
+    public void release(EGLDisplay eglDisplay) throws GlException {
+      if (singleEglContext != null) {
+        destroyEglContext(eglDisplay, singleEglContext);
+      }
     }
   }
 }

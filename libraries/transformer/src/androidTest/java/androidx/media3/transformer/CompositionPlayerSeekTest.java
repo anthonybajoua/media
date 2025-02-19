@@ -20,12 +20,14 @@ import static androidx.media3.common.util.Util.isRunningOnEmulator;
 import static androidx.media3.common.util.Util.usToMs;
 import static androidx.media3.transformer.AndroidTestUtil.MP4_ASSET;
 import static androidx.media3.transformer.AndroidTestUtil.PNG_ASSET;
-import static androidx.media3.transformer.AndroidTestUtil.recordTestSkipped;
 import static androidx.test.platform.app.InstrumentationRegistry.getInstrumentation;
 import static com.google.common.collect.Iterables.getLast;
+import static com.google.common.collect.Iterables.skip;
+import static com.google.common.collect.Iterables.transform;
 import static com.google.common.truth.Truth.assertThat;
 import static com.google.common.truth.Truth.assertWithMessage;
 import static java.util.concurrent.TimeUnit.MILLISECONDS;
+import static org.junit.Assume.assumeFalse;
 
 import android.content.Context;
 import android.view.SurfaceView;
@@ -53,18 +55,17 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executor;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.After;
-import org.junit.AssumptionViolatedException;
 import org.junit.Before;
 import org.junit.Rule;
 import org.junit.Test;
-import org.junit.rules.TestName;
 import org.junit.runner.RunWith;
 
 /**
- * Instrumentation tests for {@link CompositionPlayer} {@linkplain CompositionPlayer#seekTo
+ * Instrumentation tests for {@link CompositionPlayer} {@linkplain CompositionPlayer#seekTo(long)
  * seeking}.
  */
 @RunWith(AndroidJUnit4.class)
@@ -72,18 +73,22 @@ public class CompositionPlayerSeekTest {
 
   private static final long TEST_TIMEOUT_MS = isRunningOnEmulator() ? 20_000 : 10_000;
 
-  private static final MediaItem VIDEO_MEDIA_ITEM = MediaItem.fromUri(MP4_ASSET.uri);
   private static final long VIDEO_DURATION_US = MP4_ASSET.videoDurationUs;
+  private static final MediaItemConfig VIDEO_MEDIA_ITEM =
+      new MediaItemConfig(MediaItem.fromUri(MP4_ASSET.uri), VIDEO_DURATION_US);
   private static final ImmutableList<Long> VIDEO_TIMESTAMPS_US = MP4_ASSET.videoTimestampsUs;
-  private static final MediaItem IMAGE_MEDIA_ITEM =
-      new MediaItem.Builder().setUri(PNG_ASSET.uri).setImageDurationMs(200).build();
   private static final long IMAGE_DURATION_US = 200_000;
+  private static final MediaItemConfig IMAGE_MEDIA_ITEM =
+      new MediaItemConfig(
+          new MediaItem.Builder()
+              .setUri(PNG_ASSET.uri)
+              .setImageDurationMs(usToMs(IMAGE_DURATION_US))
+              .build(),
+          IMAGE_DURATION_US);
   // 200 ms at 30 fps (default frame rate)
   private static final ImmutableList<Long> IMAGE_TIMESTAMPS_US =
       ImmutableList.of(0L, 33_333L, 66_667L, 100_000L, 133_333L, 166_667L);
   private static final long VIDEO_GRAPH_END_TIMEOUT_MS = 1_000;
-
-  @Rule public final TestName testName = new TestName();
 
   @Rule
   public ActivityScenarioRule<SurfaceTestActivity> rule =
@@ -93,13 +98,11 @@ public class CompositionPlayerSeekTest {
       getInstrumentation().getContext().getApplicationContext();
   private final PlayerTestListener playerTestListener = new PlayerTestListener(TEST_TIMEOUT_MS);
 
-  private String testId;
   private CompositionPlayer compositionPlayer;
   private SurfaceView surfaceView;
 
   @Before
   public void setUp() {
-    testId = testName.getMethodName();
     rule.getScenario().onActivity(activity -> surfaceView = activity.getSurfaceView());
   }
 
@@ -117,23 +120,16 @@ public class CompositionPlayerSeekTest {
 
   @Test
   public void seekToZero_afterPlayingSingleSequenceOfTwoVideos() throws Exception {
-    maybeSkipTest();
-    InputTimestampRecordingShaderProgram inputTimestampRecordingShaderProgram =
-        new InputTimestampRecordingShaderProgram();
-    EditedMediaItem video =
-        createEditedMediaItem(
-            VIDEO_MEDIA_ITEM,
-            VIDEO_DURATION_US,
-            /* videoEffect= */ (GlEffect)
-                (context, useHdr) -> inputTimestampRecordingShaderProgram);
+    assumeFalse(
+        "Skipped due to failing audio decoder on API 31 emulator",
+        isRunningOnEmulator() && Util.SDK_INT == 31);
     ImmutableList<Long> sequenceTimestampsUs =
         new ImmutableList.Builder<Long>()
             // Plays the first video
             .addAll(VIDEO_TIMESTAMPS_US)
             // Plays the second video
             .addAll(
-                Iterables.transform(
-                    VIDEO_TIMESTAMPS_US, timestampUs -> VIDEO_DURATION_US + timestampUs))
+                transform(VIDEO_TIMESTAMPS_US, timestampUs -> (VIDEO_DURATION_US + timestampUs)))
             .build();
     // Seeked after the first playback ends, so the timestamps are repeated twice.
     ImmutableList<Long> expectedTimestampsUs =
@@ -141,53 +137,147 @@ public class CompositionPlayerSeekTest {
             .addAll(sequenceTimestampsUs)
             .addAll(sequenceTimestampsUs)
             .build();
-    CountDownLatch videoGraphEnded = new CountDownLatch(1);
-    getInstrumentation()
-        .runOnMainSync(
-            () -> {
-              compositionPlayer =
-                  new CompositionPlayer.Builder(applicationContext)
-                      .setPreviewingVideoGraphFactory(
-                          new ListenerCapturingVideoGraphFactory(videoGraphEnded))
-                      .build();
-              // Set a surface on the player even though there is no UI on this test. We need a
-              // surface otherwise the player will skip/drop video frames.
-              compositionPlayer.setVideoSurfaceView(surfaceView);
-              compositionPlayer.addListener(playerTestListener);
-              compositionPlayer.setComposition(
-                  new Composition.Builder(new EditedMediaItemSequence.Builder(video, video).build())
-                      .build());
-              compositionPlayer.prepare();
-              compositionPlayer.play();
-            });
-    playerTestListener.waitUntilPlayerEnded();
-    playerTestListener.resetStatus();
-    getInstrumentation().runOnMainSync(() -> compositionPlayer.seekTo(0));
-    playerTestListener.waitUntilPlayerEnded();
 
-    assertThat(videoGraphEnded.await(VIDEO_GRAPH_END_TIMEOUT_MS, MILLISECONDS)).isTrue();
-    assertThat(inputTimestampRecordingShaderProgram.getInputTimestampsUs())
+    assertThat(
+            playSequenceUntilEndedAndSeekAndGetTimestampsUs(
+                ImmutableList.of(VIDEO_MEDIA_ITEM, VIDEO_MEDIA_ITEM), /* seekTimeMs= */ 0))
         .isEqualTo(expectedTimestampsUs);
+  }
+
+  @Test
+  public void seekToFirstVideo_afterPlayingSingleSequenceOfTwoVideos() throws Exception {
+    assumeFalse(
+        "Skipped due to failing audio decoder on API 31 emulator",
+        isRunningOnEmulator() && Util.SDK_INT == 31);
+    // Skips the first three video frames
+    long seekTimeMs = 100;
+    ImmutableList<Long> sequenceTimestampsUs =
+        new ImmutableList.Builder<Long>()
+            // Plays the first video
+            .addAll(VIDEO_TIMESTAMPS_US)
+            // Plays the second video
+            .addAll(
+                transform(VIDEO_TIMESTAMPS_US, timestampUs -> (VIDEO_DURATION_US + timestampUs)))
+            // Plays the first video skipping the first three frames
+            .addAll(skip(VIDEO_TIMESTAMPS_US, /* numberToSkip= */ 3))
+            .addAll(
+                transform(VIDEO_TIMESTAMPS_US, timestampUs -> (VIDEO_DURATION_US + timestampUs)))
+            .build();
+
+    assertThat(
+            playSequenceUntilEndedAndSeekAndGetTimestampsUs(
+                ImmutableList.of(VIDEO_MEDIA_ITEM, VIDEO_MEDIA_ITEM), seekTimeMs))
+        .isEqualTo(sequenceTimestampsUs);
+  }
+
+  @Test
+  public void seekToStartOfSecondVideo_afterPlayingSingleSequenceOfTwoVideos() throws Exception {
+    assumeFalse(
+        "Skipped due to failing audio decoder on API 31 emulator",
+        isRunningOnEmulator() && Util.SDK_INT == 31);
+    // Seeks to the end of the first video
+    long seekTimeMs = usToMs(VIDEO_DURATION_US);
+    ImmutableList<Long> sequenceTimestampsUs =
+        new ImmutableList.Builder<Long>()
+            // Plays the first video
+            .addAll(VIDEO_TIMESTAMPS_US)
+            // Plays the second video
+            .addAll(
+                transform(VIDEO_TIMESTAMPS_US, timestampUs -> (VIDEO_DURATION_US + timestampUs)))
+            // Plays the second video
+            .addAll(
+                transform(VIDEO_TIMESTAMPS_US, timestampUs -> (VIDEO_DURATION_US + timestampUs)))
+            .build();
+
+    assertThat(
+            playSequenceUntilEndedAndSeekAndGetTimestampsUs(
+                ImmutableList.of(VIDEO_MEDIA_ITEM, VIDEO_MEDIA_ITEM), seekTimeMs))
+        .isEqualTo(sequenceTimestampsUs);
+  }
+
+  @Test
+  public void seekToSecondVideo_afterPlayingSingleSequenceOfTwoVideos() throws Exception {
+    assumeFalse(
+        "Skipped due to failing audio decoder on API 31 emulator",
+        isRunningOnEmulator() && Util.SDK_INT == 31);
+    // Skips the first three image frames of the second image.
+    long seekTimeMs = usToMs(VIDEO_DURATION_US) + 100;
+    ImmutableList<Long> sequenceTimestampsUs =
+        new ImmutableList.Builder<Long>()
+            // Plays the first video
+            .addAll(VIDEO_TIMESTAMPS_US)
+            // Plays the second video
+            .addAll(
+                transform(VIDEO_TIMESTAMPS_US, timestampUs -> (VIDEO_DURATION_US + timestampUs)))
+            // Plays the second video skipping the first three frames
+            .addAll(
+                transform(
+                    skip(VIDEO_TIMESTAMPS_US, /* numberToSkip= */ 3),
+                    timestampUs -> (VIDEO_DURATION_US + timestampUs)))
+            .build();
+
+    assertThat(
+            playSequenceUntilEndedAndSeekAndGetTimestampsUs(
+                ImmutableList.of(VIDEO_MEDIA_ITEM, VIDEO_MEDIA_ITEM), seekTimeMs))
+        .isEqualTo(sequenceTimestampsUs);
+  }
+
+  @Test
+  public void seekToEndOfSecondVideo_afterPlayingSingleSequenceOfTwoVideos() throws Exception {
+    assumeFalse(
+        "Skipped due to failing audio decoder on API 31 emulator",
+        isRunningOnEmulator() && Util.SDK_INT == 31);
+    // Seeks to the end of the second video
+    long seekTimeMs = usToMs(2 * VIDEO_DURATION_US);
+    ImmutableList<Long> sequenceTimestampsUs =
+        new ImmutableList.Builder<Long>()
+            // Plays the first video
+            .addAll(VIDEO_TIMESTAMPS_US)
+            // Plays the second video
+            .addAll(
+                transform(VIDEO_TIMESTAMPS_US, timestampUs -> (VIDEO_DURATION_US + timestampUs)))
+            // Plays the last frame of the second video
+            .add(1991633L)
+            .build();
+
+    assertThat(
+            playSequenceUntilEndedAndSeekAndGetTimestampsUs(
+                ImmutableList.of(VIDEO_MEDIA_ITEM, VIDEO_MEDIA_ITEM), seekTimeMs))
+        .isEqualTo(sequenceTimestampsUs);
+  }
+
+  @Test
+  public void seekToAfterEndOfSecondVideo_afterPlayingSingleSequenceOfTwoVideos() throws Exception {
+    assumeFalse(
+        "Skipped due to failing audio decoder on API 31 emulator",
+        isRunningOnEmulator() && Util.SDK_INT == 31);
+    long seekTimeMs = usToMs(3 * VIDEO_DURATION_US);
+    ImmutableList<Long> sequenceTimestampsUs =
+        new ImmutableList.Builder<Long>()
+            // Plays the first video
+            .addAll(VIDEO_TIMESTAMPS_US)
+            // Plays the second video
+            .addAll(
+                transform(VIDEO_TIMESTAMPS_US, timestampUs -> (VIDEO_DURATION_US + timestampUs)))
+            // Plays the last frame of the second video
+            .add(1991633L)
+            .build();
+
+    assertThat(
+            playSequenceUntilEndedAndSeekAndGetTimestampsUs(
+                ImmutableList.of(VIDEO_MEDIA_ITEM, VIDEO_MEDIA_ITEM), seekTimeMs))
+        .isEqualTo(sequenceTimestampsUs);
   }
 
   @Test
   public void seekToZero_afterPlayingSingleSequenceOfTwoImages() throws Exception {
-    InputTimestampRecordingShaderProgram inputTimestampRecordingShaderProgram =
-        new InputTimestampRecordingShaderProgram();
-    EditedMediaItem image =
-        createEditedMediaItem(
-            IMAGE_MEDIA_ITEM,
-            IMAGE_DURATION_US,
-            /* videoEffect= */ (GlEffect)
-                (context, useHdr) -> inputTimestampRecordingShaderProgram);
     ImmutableList<Long> sequenceTimestampsUs =
         new ImmutableList.Builder<Long>()
-            // Plays the first video
+            // Plays the first image
             .addAll(IMAGE_TIMESTAMPS_US)
-            // Plays the second video
+            // Plays the second image
             .addAll(
-                Iterables.transform(
-                    IMAGE_TIMESTAMPS_US, timestampUs -> IMAGE_DURATION_US + timestampUs))
+                transform(IMAGE_TIMESTAMPS_US, timestampUs -> (IMAGE_DURATION_US + timestampUs)))
             .build();
     // Seeked after the first playback ends, so the timestamps are repeated twice.
     ImmutableList<Long> expectedTimestampsUs =
@@ -195,40 +285,287 @@ public class CompositionPlayerSeekTest {
             .addAll(sequenceTimestampsUs)
             .addAll(sequenceTimestampsUs)
             .build();
-    CountDownLatch videoGraphEnded = new CountDownLatch(1);
-    getInstrumentation()
-        .runOnMainSync(
-            () -> {
-              compositionPlayer =
-                  new CompositionPlayer.Builder(applicationContext)
-                      .setPreviewingVideoGraphFactory(
-                          new ListenerCapturingVideoGraphFactory(videoGraphEnded))
-                      .build();
-              // Set a surface on the player even though there is no UI on this test. We need a
-              // surface otherwise the player will skip/drop video frames.
-              compositionPlayer.setVideoSurfaceView(surfaceView);
-              compositionPlayer.addListener(playerTestListener);
-              compositionPlayer.setComposition(
-                  new Composition.Builder(new EditedMediaItemSequence.Builder(image, image).build())
-                      .build());
-              compositionPlayer.prepare();
-              compositionPlayer.play();
-            });
-    playerTestListener.waitUntilPlayerEnded();
-    playerTestListener.resetStatus();
-    getInstrumentation().runOnMainSync(() -> compositionPlayer.seekTo(0));
-    playerTestListener.waitUntilPlayerEnded();
-    assertThat(videoGraphEnded.await(VIDEO_GRAPH_END_TIMEOUT_MS, MILLISECONDS)).isTrue();
 
-    assertThat(inputTimestampRecordingShaderProgram.getInputTimestampsUs())
+    assertThat(
+            playSequenceUntilEndedAndSeekAndGetTimestampsUs(
+                ImmutableList.of(IMAGE_MEDIA_ITEM, IMAGE_MEDIA_ITEM), /* seekTimeMs= */ 0))
         .isEqualTo(expectedTimestampsUs);
   }
 
   @Test
+  public void seekToFirstImage_afterPlayingSingleSequenceOfTwoImages() throws Exception {
+    // Skips the first three image frames.
+    long seekTimeMs = 100;
+    ImmutableList<Long> sequenceTimestampsUs =
+        new ImmutableList.Builder<Long>()
+            // Plays the first image
+            .addAll(IMAGE_TIMESTAMPS_US)
+            // Plays the second image
+            .addAll(
+                transform(IMAGE_TIMESTAMPS_US, timestampUs -> (IMAGE_DURATION_US + timestampUs)))
+            // Plays the first image skipping the first three frames
+            .addAll(skip(IMAGE_TIMESTAMPS_US, /* numberToSkip= */ 3))
+            .addAll(
+                transform(IMAGE_TIMESTAMPS_US, timestampUs -> (IMAGE_DURATION_US + timestampUs)))
+            .build();
+
+    assertThat(
+            playSequenceUntilEndedAndSeekAndGetTimestampsUs(
+                ImmutableList.of(IMAGE_MEDIA_ITEM, IMAGE_MEDIA_ITEM), seekTimeMs))
+        .isEqualTo(sequenceTimestampsUs);
+  }
+
+  @Test
+  public void seekToStartOfSecondImage_afterPlayingSingleSequenceOfTwoImages() throws Exception {
+    // Seeks to the start of the second image
+    long seekTimeMs = usToMs(IMAGE_DURATION_US);
+    ImmutableList<Long> sequenceTimestampsUs =
+        new ImmutableList.Builder<Long>()
+            // Plays the first image
+            .addAll(IMAGE_TIMESTAMPS_US)
+            // Plays the second image
+            .addAll(
+                transform(IMAGE_TIMESTAMPS_US, timestampUs -> (IMAGE_DURATION_US + timestampUs)))
+            // Plays the second image
+            .addAll(
+                transform(IMAGE_TIMESTAMPS_US, timestampUs -> (IMAGE_DURATION_US + timestampUs)))
+            .build();
+
+    assertThat(
+            playSequenceUntilEndedAndSeekAndGetTimestampsUs(
+                ImmutableList.of(IMAGE_MEDIA_ITEM, IMAGE_MEDIA_ITEM), seekTimeMs))
+        .isEqualTo(sequenceTimestampsUs);
+  }
+
+  @Test
+  public void seekToSecondImage_afterPlayingSingleSequenceOfTwoImages() throws Exception {
+    // Skips the first three image frames of the second image.
+    long seekTimeMs = usToMs(IMAGE_DURATION_US) + 100;
+    ImmutableList<Long> sequenceTimestampsUs =
+        new ImmutableList.Builder<Long>()
+            // Plays the first image
+            .addAll(IMAGE_TIMESTAMPS_US)
+            // Plays the second image
+            .addAll(
+                transform(IMAGE_TIMESTAMPS_US, timestampUs -> (IMAGE_DURATION_US + timestampUs)))
+            // Plays the second image skipping the first three framees
+            .addAll(
+                transform(
+                    skip(IMAGE_TIMESTAMPS_US, /* numberToSkip= */ 3),
+                    timestampUs -> (IMAGE_DURATION_US + timestampUs)))
+            .build();
+
+    assertThat(
+            playSequenceUntilEndedAndSeekAndGetTimestampsUs(
+                ImmutableList.of(IMAGE_MEDIA_ITEM, IMAGE_MEDIA_ITEM), seekTimeMs))
+        .isEqualTo(sequenceTimestampsUs);
+  }
+
+  @Test
+  public void seekToEndOfSecondImage_afterPlayingSingleSequenceOfTwoImages() throws Exception {
+    // Seeks to the end of the second image
+    long seekTimeMs = usToMs(2 * IMAGE_DURATION_US);
+    ImmutableList<Long> sequenceTimestampsUs =
+        new ImmutableList.Builder<Long>()
+            // Plays the first image
+            .addAll(IMAGE_TIMESTAMPS_US)
+            // Plays the second image
+            .addAll(
+                transform(IMAGE_TIMESTAMPS_US, timestampUs -> (IMAGE_DURATION_US + timestampUs)))
+            // Plays the last image frame, which is one microsecond smaller than the total duration.
+            .add(399_999L)
+            .build();
+
+    assertThat(
+            playSequenceUntilEndedAndSeekAndGetTimestampsUs(
+                ImmutableList.of(IMAGE_MEDIA_ITEM, IMAGE_MEDIA_ITEM), seekTimeMs))
+        .isEqualTo(sequenceTimestampsUs);
+  }
+
+  @Test
+  public void seekToAfterEndOfSecondImage_afterPlayingSingleSequenceOfTwoImages() throws Exception {
+    long seekTimeMs = usToMs(3 * IMAGE_DURATION_US);
+    ImmutableList<Long> sequenceTimestampsUs =
+        new ImmutableList.Builder<Long>()
+            // Plays the first image
+            .addAll(IMAGE_TIMESTAMPS_US)
+            // Plays the second image
+            .addAll(
+                transform(IMAGE_TIMESTAMPS_US, timestampUs -> (IMAGE_DURATION_US + timestampUs)))
+            // Plays the last image frame, which is one microsecond smaller than the total duration.
+            .add(399_999L)
+            .build();
+
+    assertThat(
+            playSequenceUntilEndedAndSeekAndGetTimestampsUs(
+                ImmutableList.of(IMAGE_MEDIA_ITEM, IMAGE_MEDIA_ITEM), seekTimeMs))
+        .isEqualTo(sequenceTimestampsUs);
+  }
+
+  @Test
+  public void seekToZero_afterPlayingSingleSequenceOfVideoAndImage() throws Exception {
+    assumeFalse(
+        "Skipped due to failing audio decoder on API 31 emulator",
+        isRunningOnEmulator() && Util.SDK_INT == 31);
+    ImmutableList<Long> sequenceTimestampsUs =
+        new ImmutableList.Builder<Long>()
+            // Plays the video
+            .addAll(VIDEO_TIMESTAMPS_US)
+            // Plays the image
+            .addAll(
+                transform(IMAGE_TIMESTAMPS_US, timestampUs -> (VIDEO_DURATION_US + timestampUs)))
+            .build();
+    // Seeked after the first playback ends, so the timestamps are repeated twice.
+    ImmutableList<Long> expectedTimestampsUs =
+        new ImmutableList.Builder<Long>()
+            .addAll(sequenceTimestampsUs)
+            .addAll(sequenceTimestampsUs)
+            .build();
+
+    assertThat(
+            playSequenceUntilEndedAndSeekAndGetTimestampsUs(
+                ImmutableList.of(VIDEO_MEDIA_ITEM, IMAGE_MEDIA_ITEM), /* seekTimeMs= */ 0))
+        .isEqualTo(expectedTimestampsUs);
+  }
+
+  @Test
+  public void seekToVideo_afterPlayingSingleSequenceOfVideoAndImage() throws Exception {
+    assumeFalse(
+        "Skipped due to failing audio decoder on API 31 emulator",
+        isRunningOnEmulator() && Util.SDK_INT == 31);
+    // Skips three video frames
+    long seekTimeMs = 100;
+    ImmutableList<Long> sequenceTimestampsUs =
+        new ImmutableList.Builder<Long>()
+            // Plays the video
+            .addAll(VIDEO_TIMESTAMPS_US)
+            // Plays the image
+            .addAll(
+                transform(IMAGE_TIMESTAMPS_US, timestampUs -> (VIDEO_DURATION_US + timestampUs)))
+            // Plays the video skipping the first three frames
+            .addAll(skip(VIDEO_TIMESTAMPS_US, /* numberToSkip= */ 3))
+            // Plays the image
+            .addAll(
+                transform(IMAGE_TIMESTAMPS_US, timestampUs -> (VIDEO_DURATION_US + timestampUs)))
+            .build();
+
+    assertThat(
+            playSequenceUntilEndedAndSeekAndGetTimestampsUs(
+                ImmutableList.of(VIDEO_MEDIA_ITEM, IMAGE_MEDIA_ITEM), seekTimeMs))
+        .isEqualTo(sequenceTimestampsUs);
+  }
+
+  @Test
+  public void seekToImage_afterPlayingSingleSequenceOfVideoAndImage() throws Exception {
+    assumeFalse(
+        "Skipped due to failing audio decoder on API 31 emulator",
+        isRunningOnEmulator() && Util.SDK_INT == 31);
+    // Skips video frames and three image frames
+    long seekTimeMs = usToMs(VIDEO_DURATION_US) + 100;
+    ImmutableList<Long> sequenceTimestampsUs =
+        new ImmutableList.Builder<Long>()
+            // Plays the video
+            .addAll(VIDEO_TIMESTAMPS_US)
+            // Plays the image
+            .addAll(
+                transform(IMAGE_TIMESTAMPS_US, timestampUs -> (VIDEO_DURATION_US + timestampUs)))
+            // Plays the image
+            .addAll(
+                transform(
+                    skip(IMAGE_TIMESTAMPS_US, /* numberToSkip= */ 3),
+                    timestampUs -> (VIDEO_DURATION_US + timestampUs)))
+            .build();
+
+    assertThat(
+            playSequenceUntilEndedAndSeekAndGetTimestampsUs(
+                ImmutableList.of(VIDEO_MEDIA_ITEM, IMAGE_MEDIA_ITEM), seekTimeMs))
+        .isEqualTo(sequenceTimestampsUs);
+  }
+
+  @Test
+  public void seekToZero_afterPlayingSingleSequenceOfImageAndVideo() throws Exception {
+    // The MediaCodec decoder's output surface is sometimes dropping frames on emulator despite
+    // using MediaFormat.KEY_ALLOW_FRAME_DROP.
+    assumeFalse("Skipped on emulator due to surface dropping frames", isRunningOnEmulator());
+    ImmutableList<Long> sequenceTimestampsUs =
+        new ImmutableList.Builder<Long>()
+            // Plays the image
+            .addAll(IMAGE_TIMESTAMPS_US)
+            // Plays the video
+            .addAll(
+                transform(VIDEO_TIMESTAMPS_US, timestampUs -> (IMAGE_DURATION_US + timestampUs)))
+            .build();
+    // Seeked after the first playback ends, so the timestamps are repeated twice.
+    ImmutableList<Long> expectedTimestampsUs =
+        new ImmutableList.Builder<Long>()
+            .addAll(sequenceTimestampsUs)
+            .addAll(sequenceTimestampsUs)
+            .build();
+
+    assertThat(
+            playSequenceUntilEndedAndSeekAndGetTimestampsUs(
+                ImmutableList.of(IMAGE_MEDIA_ITEM, VIDEO_MEDIA_ITEM), /* seekTimeMs= */ 0))
+        .isEqualTo(expectedTimestampsUs);
+  }
+
+  @Test
+  public void seekToImage_afterPlayingSingleSequenceOfImageAndVideo() throws Exception {
+    // The MediaCodec decoder's output surface is sometimes dropping frames on emulator despite
+    // using MediaFormat.KEY_ALLOW_FRAME_DROP.
+    assumeFalse("Skipped on emulator due to surface dropping frames", isRunningOnEmulator());
+    // Skips three image frames
+    long seekTimeMs = 100;
+    ImmutableList<Long> sequenceTimestampsUs =
+        new ImmutableList.Builder<Long>()
+            // Plays the image
+            .addAll(IMAGE_TIMESTAMPS_US)
+            // Plays the video
+            .addAll(
+                transform(VIDEO_TIMESTAMPS_US, timestampUs -> (IMAGE_DURATION_US + timestampUs)))
+            // Seek skipping 3 image frames
+            .addAll(skip(IMAGE_TIMESTAMPS_US, 3))
+            .addAll(
+                transform(VIDEO_TIMESTAMPS_US, timestampUs -> (IMAGE_DURATION_US + timestampUs)))
+            .build();
+
+    assertThat(
+            playSequenceUntilEndedAndSeekAndGetTimestampsUs(
+                ImmutableList.of(IMAGE_MEDIA_ITEM, VIDEO_MEDIA_ITEM), seekTimeMs))
+        .isEqualTo(sequenceTimestampsUs);
+  }
+
+  @Test
+  public void seekToVideo_afterPlayingSingleSequenceOfImageAndVideo() throws Exception {
+    assumeFalse(
+        "Skipped due to failing audio decoder on API 31 emulator",
+        isRunningOnEmulator() && Util.SDK_INT == 31);
+    // Skips to the first video frame.
+    long seekTimeMs = usToMs(IMAGE_DURATION_US);
+    ImmutableList<Long> sequenceTimestampsUs =
+        new ImmutableList.Builder<Long>()
+            // Plays the image
+            .addAll(IMAGE_TIMESTAMPS_US)
+            // Plays the video
+            .addAll(
+                transform(VIDEO_TIMESTAMPS_US, timestampUs -> (IMAGE_DURATION_US + timestampUs)))
+            // Plays the video again
+            .addAll(
+                transform(VIDEO_TIMESTAMPS_US, timestampUs -> (IMAGE_DURATION_US + timestampUs)))
+            .build();
+
+    assertThat(
+            playSequenceUntilEndedAndSeekAndGetTimestampsUs(
+                ImmutableList.of(IMAGE_MEDIA_ITEM, VIDEO_MEDIA_ITEM), seekTimeMs))
+        .isEqualTo(sequenceTimestampsUs);
+  }
+
+  @Test
   public void seekToZero_duringPlayingFirstVideoInSingleSequenceOfTwoVideos() throws Exception {
-    maybeSkipTest();
-    ImmutableList<MediaItem> mediaItems = ImmutableList.of(VIDEO_MEDIA_ITEM, VIDEO_MEDIA_ITEM);
-    ImmutableList<Long> durationsUs = ImmutableList.of(VIDEO_DURATION_US, VIDEO_DURATION_US);
+    assumeFalse(
+        "Skipped due to failing audio decoder on API 31 emulator",
+        isRunningOnEmulator() && Util.SDK_INT == 31);
+    ImmutableList<MediaItemConfig> mediaItems =
+        ImmutableList.of(VIDEO_MEDIA_ITEM, VIDEO_MEDIA_ITEM);
     int numberOfFramesBeforeSeeking = 15;
     ImmutableList<Long> expectedTimestampsUs =
         new ImmutableList.Builder<Long>()
@@ -239,52 +576,24 @@ public class CompositionPlayerSeekTest {
             .addAll(VIDEO_TIMESTAMPS_US)
             // Plays the second video
             .addAll(
-                Iterables.transform(
-                    VIDEO_TIMESTAMPS_US, timestampUs -> VIDEO_DURATION_US + timestampUs))
+                transform(VIDEO_TIMESTAMPS_US, timestampUs -> (VIDEO_DURATION_US + timestampUs)))
             .build();
 
     ImmutableList<Long> actualTimestampsUs =
         playSequenceAndGetTimestampsUs(
-            mediaItems, durationsUs, numberOfFramesBeforeSeeking, /* seekTimeMs= */ 0);
+            mediaItems, numberOfFramesBeforeSeeking, /* seekTimeMs= */ 0);
 
     assertThat(actualTimestampsUs).isEqualTo(expectedTimestampsUs);
   }
 
   @Test
-  public void seekToFirstMedia_duringPlayingFirstVideoInSingleSequenceOfTwoVideos()
+  public void seekToSecondVideo_duringPlayingFirstVideoInSingleSequenceOfTwoVideos()
       throws Exception {
-    maybeSkipTest();
-    ImmutableList<MediaItem> mediaItems = ImmutableList.of(VIDEO_MEDIA_ITEM, VIDEO_MEDIA_ITEM);
-    ImmutableList<Long> durationsUs = ImmutableList.of(VIDEO_DURATION_US, VIDEO_DURATION_US);
-    int numberOfFramesBeforeSeeking = 15;
-    // 100ms into the first video, should skip the first 3 frames.
-    long seekTimeMs = 100;
-    ImmutableList<Long> expectedTimestampsUs =
-        new ImmutableList.Builder<Long>()
-            // Plays the first 15 frames of the first video
-            .addAll(
-                Iterables.limit(VIDEO_TIMESTAMPS_US, /* limitSize= */ numberOfFramesBeforeSeeking))
-            // Seek, skipping the first 3 frames of the first video
-            .addAll(Iterables.skip(VIDEO_TIMESTAMPS_US, /* numberToSkip= */ 3))
-            // Plays the second video
-            .addAll(
-                Iterables.transform(
-                    VIDEO_TIMESTAMPS_US, timestampUs -> VIDEO_DURATION_US + timestampUs))
-            .build();
-
-    ImmutableList<Long> actualTimestampsUs =
-        playSequenceAndGetTimestampsUs(
-            mediaItems, durationsUs, numberOfFramesBeforeSeeking, seekTimeMs);
-
-    assertThat(actualTimestampsUs).isEqualTo(expectedTimestampsUs);
-  }
-
-  @Test
-  public void seekToSecondMedia_duringPlayingFirstVideoInSingleSequenceOfTwoVideos()
-      throws Exception {
-    maybeSkipTest();
-    ImmutableList<MediaItem> mediaItems = ImmutableList.of(VIDEO_MEDIA_ITEM, VIDEO_MEDIA_ITEM);
-    ImmutableList<Long> durationsUs = ImmutableList.of(VIDEO_DURATION_US, VIDEO_DURATION_US);
+    assumeFalse(
+        "Skipped due to failing audio decoder on API 31 emulator",
+        isRunningOnEmulator() && Util.SDK_INT == 31);
+    ImmutableList<MediaItemConfig> mediaItems =
+        ImmutableList.of(VIDEO_MEDIA_ITEM, VIDEO_MEDIA_ITEM);
     int numberOfFramesBeforeSeeking = 15;
     // 100ms into the second video, should skip the first 3 frames.
     long seekTimeMs = 1124;
@@ -295,24 +604,25 @@ public class CompositionPlayerSeekTest {
                 Iterables.limit(VIDEO_TIMESTAMPS_US, /* limitSize= */ numberOfFramesBeforeSeeking))
             // Skipping the first 3 frames of the second video
             .addAll(
-                Iterables.transform(
+                transform(
                     Iterables.skip(VIDEO_TIMESTAMPS_US, /* numberToSkip= */ 3),
-                    timestampUs -> VIDEO_DURATION_US + timestampUs))
+                    timestampUs -> (VIDEO_DURATION_US + timestampUs)))
             .build();
 
     ImmutableList<Long> actualTimestampsUs =
-        playSequenceAndGetTimestampsUs(
-            mediaItems, durationsUs, numberOfFramesBeforeSeeking, seekTimeMs);
+        playSequenceAndGetTimestampsUs(mediaItems, numberOfFramesBeforeSeeking, seekTimeMs);
 
     assertThat(actualTimestampsUs).isEqualTo(expectedTimestampsUs);
   }
 
   @Test
-  public void seekToFirstMedia_duringPlayingSecondVideoInSingleSequenceOfTwoVideos()
+  public void seekToFirstVideo_duringPlayingSecondVideoInSingleSequenceOfTwoVideos()
       throws Exception {
-    maybeSkipTest();
-    ImmutableList<MediaItem> mediaItems = ImmutableList.of(VIDEO_MEDIA_ITEM, VIDEO_MEDIA_ITEM);
-    ImmutableList<Long> durationsUs = ImmutableList.of(VIDEO_DURATION_US, VIDEO_DURATION_US);
+    assumeFalse(
+        "Skipped due to failing audio decoder on API 31 emulator",
+        isRunningOnEmulator() && Util.SDK_INT == 31);
+    ImmutableList<MediaItemConfig> mediaItems =
+        ImmutableList.of(VIDEO_MEDIA_ITEM, VIDEO_MEDIA_ITEM);
     int numberOfFramesBeforeSeeking = 45;
     // 100ms into the first video, should skip the first 3 frames.
     long seekTimeMs = 100;
@@ -322,62 +632,30 @@ public class CompositionPlayerSeekTest {
             .addAll(VIDEO_TIMESTAMPS_US)
             // Play the first 15 frames of the seconds video
             .addAll(
-                Iterables.transform(
+                transform(
                     Iterables.limit(VIDEO_TIMESTAMPS_US, /* limitSize= */ 15),
-                    timestampUs -> VIDEO_DURATION_US + timestampUs))
+                    timestampUs -> (VIDEO_DURATION_US + timestampUs)))
             // Seek to the first, skipping the first 3 frames.
             .addAll(Iterables.skip(VIDEO_TIMESTAMPS_US, /* numberToSkip= */ 3))
             // Plays the second video
             .addAll(
-                Iterables.transform(
-                    VIDEO_TIMESTAMPS_US, timestampUs -> VIDEO_DURATION_US + timestampUs))
+                transform(VIDEO_TIMESTAMPS_US, timestampUs -> (VIDEO_DURATION_US + timestampUs)))
             .build();
 
     ImmutableList<Long> actualTimestampsUs =
-        playSequenceAndGetTimestampsUs(
-            mediaItems, durationsUs, numberOfFramesBeforeSeeking, seekTimeMs);
+        playSequenceAndGetTimestampsUs(mediaItems, numberOfFramesBeforeSeeking, seekTimeMs);
 
     assertThat(actualTimestampsUs).isEqualTo(expectedTimestampsUs);
   }
 
   @Test
-  public void seekToSecondMedia_duringPlayingSecondVideoInSingleSequenceOfTwoVideos()
+  public void seekToEndOfFirstVideo_duringPlayingFirstVideoInSingleSequenceOfTwoVideos()
       throws Exception {
-    maybeSkipTest();
-    ImmutableList<MediaItem> mediaItems = ImmutableList.of(VIDEO_MEDIA_ITEM, VIDEO_MEDIA_ITEM);
-    ImmutableList<Long> durationsUs = ImmutableList.of(VIDEO_DURATION_US, VIDEO_DURATION_US);
-    int numberOfFramesBeforeSeeking = 45;
-    // 100ms into the second video, should skip the first 3 frames.
-    long seekTimeMs = 1124;
-    ImmutableList<Long> expectedTimestampsUs =
-        new ImmutableList.Builder<Long>()
-            // Play first video
-            .addAll(VIDEO_TIMESTAMPS_US)
-            // Play the first 15 frames of the seconds video
-            .addAll(
-                Iterables.transform(
-                    Iterables.limit(VIDEO_TIMESTAMPS_US, /* limitSize= */ 15),
-                    timestampUs -> VIDEO_DURATION_US + timestampUs))
-            // Seek to the second, skipping the first 3 frames.
-            .addAll(
-                Iterables.transform(
-                    Iterables.skip(VIDEO_TIMESTAMPS_US, /* numberToSkip= */ 3),
-                    timestampUs -> VIDEO_DURATION_US + timestampUs))
-            .build();
-
-    ImmutableList<Long> actualTimestampsUs =
-        playSequenceAndGetTimestampsUs(
-            mediaItems, durationsUs, numberOfFramesBeforeSeeking, seekTimeMs);
-
-    assertThat(actualTimestampsUs).isEqualTo(expectedTimestampsUs);
-  }
-
-  @Test
-  public void seekToEndOfFirstMedia_duringPlayingFirstVideoInSingleSequenceOfTwoVideos()
-      throws Exception {
-    maybeSkipTest();
-    ImmutableList<MediaItem> mediaItems = ImmutableList.of(VIDEO_MEDIA_ITEM, VIDEO_MEDIA_ITEM);
-    ImmutableList<Long> durationsUs = ImmutableList.of(VIDEO_DURATION_US, VIDEO_DURATION_US);
+    assumeFalse(
+        "Skipped due to failing audio decoder on API 31 emulator",
+        isRunningOnEmulator() && Util.SDK_INT == 31);
+    ImmutableList<MediaItemConfig> mediaItems =
+        ImmutableList.of(VIDEO_MEDIA_ITEM, VIDEO_MEDIA_ITEM);
     int numberOfFramesBeforeSeeking = 15;
     // Seek to the duration of the first video.
     long seekTimeMs = usToMs(VIDEO_DURATION_US);
@@ -388,13 +666,11 @@ public class CompositionPlayerSeekTest {
                 Iterables.limit(VIDEO_TIMESTAMPS_US, /* limitSize= */ numberOfFramesBeforeSeeking))
             // Plays the second video
             .addAll(
-                Iterables.transform(
-                    VIDEO_TIMESTAMPS_US, timestampUs -> VIDEO_DURATION_US + timestampUs))
+                transform(VIDEO_TIMESTAMPS_US, timestampUs -> (VIDEO_DURATION_US + timestampUs)))
             .build();
 
     ImmutableList<Long> actualTimestampsUs =
-        playSequenceAndGetTimestampsUs(
-            mediaItems, durationsUs, numberOfFramesBeforeSeeking, seekTimeMs);
+        playSequenceAndGetTimestampsUs(mediaItems, numberOfFramesBeforeSeeking, seekTimeMs);
 
     assertThat(actualTimestampsUs).isEqualTo(expectedTimestampsUs);
   }
@@ -402,9 +678,11 @@ public class CompositionPlayerSeekTest {
   @Test
   public void seekToEndOfSecondVideo_duringPlayingFirstVideoInSingleSequenceOfTwoVideos()
       throws Exception {
-    maybeSkipTest();
-    ImmutableList<MediaItem> mediaItems = ImmutableList.of(VIDEO_MEDIA_ITEM, VIDEO_MEDIA_ITEM);
-    ImmutableList<Long> durationsUs = ImmutableList.of(VIDEO_DURATION_US, VIDEO_DURATION_US);
+    assumeFalse(
+        "Skipped due to failing audio decoder on API 31 emulator",
+        isRunningOnEmulator() && Util.SDK_INT == 31);
+    ImmutableList<MediaItemConfig> mediaItems =
+        ImmutableList.of(VIDEO_MEDIA_ITEM, VIDEO_MEDIA_ITEM);
     int numberOfFramesBeforeSeeking = 15;
     // Seek to after the composition ends.
     long seekTimeMs = 10_000_000L;
@@ -418,16 +696,14 @@ public class CompositionPlayerSeekTest {
             .build();
 
     ImmutableList<Long> actualTimestampsUs =
-        playSequenceAndGetTimestampsUs(
-            mediaItems, durationsUs, numberOfFramesBeforeSeeking, seekTimeMs);
+        playSequenceAndGetTimestampsUs(mediaItems, numberOfFramesBeforeSeeking, seekTimeMs);
 
     assertThat(actualTimestampsUs).isEqualTo(expectedTimestampsUs);
   }
 
   @Test
-  public void seekToImage_fromSameImage() throws Exception {
-    ImmutableList<MediaItem> mediaItems = ImmutableList.of(IMAGE_MEDIA_ITEM);
-    ImmutableList<Long> durationsUs = ImmutableList.of(IMAGE_DURATION_US);
+  public void seekToFirstImage_duringPlayingFirstImageInSequenceOfTwoImages() throws Exception {
+    ImmutableList<MediaItemConfig> mediaItems = ImmutableList.of(IMAGE_MEDIA_ITEM);
     int numberOfFramesBeforeSeeking = 2;
     // Should skip the first 3 frames.
     long seekTimeMs = 100;
@@ -441,16 +717,15 @@ public class CompositionPlayerSeekTest {
             .build();
 
     ImmutableList<Long> actualTimestampsUs =
-        playSequenceAndGetTimestampsUs(
-            mediaItems, durationsUs, numberOfFramesBeforeSeeking, seekTimeMs);
+        playSequenceAndGetTimestampsUs(mediaItems, numberOfFramesBeforeSeeking, seekTimeMs);
 
     assertThat(actualTimestampsUs).isEqualTo(expectedTimestampsUs);
   }
 
   @Test
-  public void seekToImage_fromOtherImage() throws Exception {
-    ImmutableList<MediaItem> mediaItems = ImmutableList.of(IMAGE_MEDIA_ITEM, IMAGE_MEDIA_ITEM);
-    ImmutableList<Long> durationsUs = ImmutableList.of(IMAGE_DURATION_US, IMAGE_DURATION_US);
+  public void seekToSecondImage_duringPlayingFirstImageInSequenceOfTwoImages() throws Exception {
+    ImmutableList<MediaItemConfig> mediaItems =
+        ImmutableList.of(IMAGE_MEDIA_ITEM, IMAGE_MEDIA_ITEM);
     int numberOfFramesBeforeSeeking = 2;
     // Should skip the first 3 frames of the second image.
     long seekTimeMs = Util.usToMs(IMAGE_DURATION_US) + 100;
@@ -461,23 +736,24 @@ public class CompositionPlayerSeekTest {
                 Iterables.limit(IMAGE_TIMESTAMPS_US, /* limitSize= */ numberOfFramesBeforeSeeking))
             // Skipping the first 3 frames of the second image
             .addAll(
-                Iterables.transform(
+                transform(
                     Iterables.skip(IMAGE_TIMESTAMPS_US, /* numberToSkip= */ 3),
-                    timestampUs -> IMAGE_DURATION_US + timestampUs))
+                    timestampUs -> (IMAGE_DURATION_US + timestampUs)))
             .build();
 
     ImmutableList<Long> actualTimestampsUs =
-        playSequenceAndGetTimestampsUs(
-            mediaItems, durationsUs, numberOfFramesBeforeSeeking, seekTimeMs);
+        playSequenceAndGetTimestampsUs(mediaItems, numberOfFramesBeforeSeeking, seekTimeMs);
 
     assertThat(actualTimestampsUs).isEqualTo(expectedTimestampsUs);
   }
 
   @Test
-  public void seekToImage_fromVideoInVideoImageSequence() throws Exception {
-    maybeSkipTest();
-    ImmutableList<MediaItem> mediaItems = ImmutableList.of(VIDEO_MEDIA_ITEM, IMAGE_MEDIA_ITEM);
-    ImmutableList<Long> durationsUs = ImmutableList.of(VIDEO_DURATION_US, IMAGE_DURATION_US);
+  public void seekToImage_duringPlayingFirstImageInSequenceOfVideoAndImage() throws Exception {
+    assumeFalse(
+        "Skipped due to failing audio decoder on API 31 emulator",
+        isRunningOnEmulator() && Util.SDK_INT == 31);
+    ImmutableList<MediaItemConfig> mediaItems =
+        ImmutableList.of(VIDEO_MEDIA_ITEM, IMAGE_MEDIA_ITEM);
     int numberOfFramesBeforeSeeking = 15;
     // Should skip the first 3 frames of the image.
     long seekTimeMs = Util.usToMs(VIDEO_DURATION_US) + 100;
@@ -488,88 +764,24 @@ public class CompositionPlayerSeekTest {
                 Iterables.limit(VIDEO_TIMESTAMPS_US, /* limitSize= */ numberOfFramesBeforeSeeking))
             // Skipping the first 3 frames of the image
             .addAll(
-                Iterables.transform(
+                transform(
                     Iterables.skip(IMAGE_TIMESTAMPS_US, /* numberToSkip= */ 3),
-                    timestampUs -> VIDEO_DURATION_US + timestampUs))
+                    timestampUs -> (VIDEO_DURATION_US + timestampUs)))
             .build();
 
     ImmutableList<Long> actualTimestampsUs =
-        playSequenceAndGetTimestampsUs(
-            mediaItems, durationsUs, numberOfFramesBeforeSeeking, seekTimeMs);
+        playSequenceAndGetTimestampsUs(mediaItems, numberOfFramesBeforeSeeking, seekTimeMs);
 
     assertThat(actualTimestampsUs).isEqualTo(expectedTimestampsUs);
   }
 
   @Test
-  public void seekToImage_fromVideoInImageVideoSequence() throws Exception {
-    maybeSkipTest();
-    ImmutableList<MediaItem> mediaItems = ImmutableList.of(IMAGE_MEDIA_ITEM, VIDEO_MEDIA_ITEM);
-    ImmutableList<Long> durationsUs = ImmutableList.of(IMAGE_DURATION_US, VIDEO_DURATION_US);
-    // Plays all 6 image frames, play 9 video frames and seek.
-    int numberOfFramesBeforeSeeking = 15;
-    // Should skip the first 3 frames of the image.
-    long seekTimeMs = 100;
-    ImmutableList<Long> expectedTimestampsUs =
-        new ImmutableList.Builder<Long>()
-            // Play the image frames
-            .addAll(IMAGE_TIMESTAMPS_US)
-            // Play the first 9 frames of the video
-            .addAll(
-                Iterables.transform(
-                    Iterables.limit(VIDEO_TIMESTAMPS_US, /* limitSize= */ 9),
-                    timestampUs -> IMAGE_DURATION_US + timestampUs))
-            // Skipping the first 3 frames of the image
-            .addAll(Iterables.skip(IMAGE_TIMESTAMPS_US, /* numberToSkip= */ 3))
-            // Play the video
-            .addAll(
-                Iterables.transform(
-                    VIDEO_TIMESTAMPS_US, timestampUs -> IMAGE_DURATION_US + timestampUs))
-            .build();
-
-    ImmutableList<Long> actualTimestampsUs =
-        playSequenceAndGetTimestampsUs(
-            mediaItems, durationsUs, numberOfFramesBeforeSeeking, seekTimeMs);
-
-    assertThat(actualTimestampsUs).isEqualTo(expectedTimestampsUs);
-  }
-
-  @Test
-  public void seekToVideo_fromImageInVideoImageSequence() throws Exception {
-    maybeSkipTest();
-    ImmutableList<MediaItem> mediaItems = ImmutableList.of(VIDEO_MEDIA_ITEM, IMAGE_MEDIA_ITEM);
-    ImmutableList<Long> durationsUs = ImmutableList.of(VIDEO_DURATION_US, IMAGE_DURATION_US);
-    // Play all the video, seek after playing 3 frames of image.
-    int numberOfFramesBeforeSeeking = 33;
-    // Should skip the first 3 frames of the video.
-    long seekTimeMs = 100;
-    ImmutableList<Long> expectedTimestampsUs =
-        new ImmutableList.Builder<Long>()
-            // Play the video
-            .addAll(VIDEO_TIMESTAMPS_US)
-            // Play the first 3 frames of the image
-            .addAll(
-                Iterables.transform(
-                    Iterables.limit(IMAGE_TIMESTAMPS_US, /* limitSize= */ 3),
-                    timestampUs -> VIDEO_DURATION_US + timestampUs))
-            // Skipping the first 3 frames of the video
-            .addAll(Iterables.skip(VIDEO_TIMESTAMPS_US, /* numberToSkip= */ 3))
-            .addAll(
-                Iterables.transform(
-                    IMAGE_TIMESTAMPS_US, timestampUs -> VIDEO_DURATION_US + timestampUs))
-            .build();
-
-    ImmutableList<Long> actualTimestampsUs =
-        playSequenceAndGetTimestampsUs(
-            mediaItems, durationsUs, numberOfFramesBeforeSeeking, seekTimeMs);
-
-    assertThat(actualTimestampsUs).isEqualTo(expectedTimestampsUs);
-  }
-
-  @Test
-  public void seekToVideo_fromImageInImageVideoSequence() throws Exception {
-    maybeSkipTest();
-    ImmutableList<MediaItem> mediaItems = ImmutableList.of(IMAGE_MEDIA_ITEM, VIDEO_MEDIA_ITEM);
-    ImmutableList<Long> durationsUs = ImmutableList.of(IMAGE_DURATION_US, VIDEO_DURATION_US);
+  public void seekToVideo_duringPlayingFirstImageInSequenceOfImageAndVideo() throws Exception {
+    assumeFalse(
+        "Skipped due to failing audio decoder on API 31 emulator",
+        isRunningOnEmulator() && Util.SDK_INT == 31);
+    ImmutableList<MediaItemConfig> mediaItems =
+        ImmutableList.of(IMAGE_MEDIA_ITEM, VIDEO_MEDIA_ITEM);
     int numberOfFramesBeforeSeeking = 3;
     // Should skip the first 3 frames of the video.
     long seekTimeMs = Util.usToMs(IMAGE_DURATION_US) + 100;
@@ -580,24 +792,48 @@ public class CompositionPlayerSeekTest {
                 Iterables.limit(IMAGE_TIMESTAMPS_US, /* limitSize= */ numberOfFramesBeforeSeeking))
             // Skipping the first 3 frames of the video
             .addAll(
-                Iterables.transform(
+                transform(
                     Iterables.skip(VIDEO_TIMESTAMPS_US, /* numberToSkip= */ 3),
-                    timestampUs -> IMAGE_DURATION_US + timestampUs))
+                    timestampUs -> (IMAGE_DURATION_US + timestampUs)))
             .build();
 
     ImmutableList<Long> actualTimestampsUs =
-        playSequenceAndGetTimestampsUs(
-            mediaItems, durationsUs, numberOfFramesBeforeSeeking, seekTimeMs);
+        playSequenceAndGetTimestampsUs(mediaItems, numberOfFramesBeforeSeeking, seekTimeMs);
 
     assertThat(actualTimestampsUs).isEqualTo(expectedTimestampsUs);
   }
 
-  private void maybeSkipTest() throws Exception {
-    if (isRunningOnEmulator() && Util.SDK_INT == 31) {
-      // The audio decoder is failing on API 31 emulator.
-      recordTestSkipped(applicationContext, testId, /* reason= */ "Skipped due to failing decoder");
-      throw new AssumptionViolatedException("Skipped due to failing decoder");
-    }
+  @Test
+  public void
+      seekToSecondVideo_duringPlayingFirstVideoInSingleSequenceOfTwoVideosWithPrewarmingDisabled()
+          throws Exception {
+    assumeFalse(
+        "Skipped due to failing audio decoder", isRunningOnEmulator() && Util.SDK_INT == 31);
+    ImmutableList<MediaItemConfig> mediaItems =
+        ImmutableList.of(VIDEO_MEDIA_ITEM, VIDEO_MEDIA_ITEM);
+    int numberOfFramesBeforeSeeking = 15;
+    // 100ms into the second video, should skip the first 3 frames.
+    long seekTimeMs = 1124;
+    ImmutableList<Long> expectedTimestampsUs =
+        new ImmutableList.Builder<Long>()
+            // Plays the first 15 frames of the first video
+            .addAll(
+                Iterables.limit(VIDEO_TIMESTAMPS_US, /* limitSize= */ numberOfFramesBeforeSeeking))
+            // Skipping the first 3 frames of the second video
+            .addAll(
+                transform(
+                    Iterables.skip(VIDEO_TIMESTAMPS_US, /* numberToSkip= */ 3),
+                    timestampUs -> (VIDEO_DURATION_US + timestampUs)))
+            .build();
+
+    ImmutableList<Long> actualTimestampsUs =
+        playSequenceAndGetTimestampsUs(
+            mediaItems,
+            numberOfFramesBeforeSeeking,
+            seekTimeMs,
+            /* videoPrewarmingEnabled= */ false);
+
+    assertThat(actualTimestampsUs).isEqualTo(expectedTimestampsUs);
   }
 
   /**
@@ -606,20 +842,26 @@ public class CompositionPlayerSeekTest {
    * frames, in microsecond.
    */
   private ImmutableList<Long> playSequenceAndGetTimestampsUs(
-      List<MediaItem> mediaItems,
-      List<Long> durationsUs,
+      List<MediaItemConfig> mediaItems,
       int numberOfFramesBeforeSeeking,
-      long seekTimeMs)
+      long seekTimeMs,
+      boolean videoPrewarmingEnabled)
       throws Exception {
     ResettableCountDownLatch frameCountBeforeBlockLatch =
         new ResettableCountDownLatch(numberOfFramesBeforeSeeking);
     InputTimestampRecordingShaderProgram inputTimestampRecordingShaderProgram =
         createInputTimestampRecordingShaderProgram(frameCountBeforeBlockLatch);
-    Effect videoEffect = (GlEffect) (context, useHdr) -> inputTimestampRecordingShaderProgram;
-    List<EditedMediaItem> editedMediaItems =
-        createEditedMediaItems(mediaItems, durationsUs, videoEffect);
     CountDownLatch videoGraphEnded = new CountDownLatch(1);
     AtomicReference<@NullableType PlaybackException> playbackException = new AtomicReference<>();
+
+    List<EditedMediaItem> editedMediaItems = new ArrayList<>();
+    for (int i = 0; i < mediaItems.size(); i++) {
+      editedMediaItems.add(
+          createEditedMediaItem(
+              mediaItems.get(i),
+              /* videoEffect= */ (GlEffect)
+                  (context, useHdr) -> inputTimestampRecordingShaderProgram));
+    }
 
     getInstrumentation()
         .runOnMainSync(
@@ -628,6 +870,7 @@ public class CompositionPlayerSeekTest {
                   new CompositionPlayer.Builder(applicationContext)
                       .setPreviewingVideoGraphFactory(
                           new ListenerCapturingVideoGraphFactory(videoGraphEnded))
+                      .setVideoPrewarmingEnabled(videoPrewarmingEnabled)
                       .build();
               // Set a surface on the player even though there is no UI on this test. We need a
               // surface otherwise the player will skip/drop video frames.
@@ -660,6 +903,74 @@ public class CompositionPlayerSeekTest {
     playerTestListener.waitUntilPlayerEnded();
 
     assertThat(videoGraphEnded.await(VIDEO_GRAPH_END_TIMEOUT_MS, MILLISECONDS)).isTrue();
+    return inputTimestampRecordingShaderProgram.getInputTimestampsUs();
+  }
+
+  /**
+   * Plays the first {@code numberOfFramesBeforeSeeking} frames of the provided sequence, seeks to
+   * {@code seekTimeMs}, resumes playback until it ends, and returns the timestamps of the processed
+   * frames, in microsecond.
+   */
+  private ImmutableList<Long> playSequenceAndGetTimestampsUs(
+      List<MediaItemConfig> mediaItems, int numberOfFramesBeforeSeeking, long seekTimeMs)
+      throws Exception {
+    return playSequenceAndGetTimestampsUs(
+        mediaItems, numberOfFramesBeforeSeeking, seekTimeMs, /* videoPrewarmingEnabled= */ true);
+  }
+
+  /**
+   * Plays the {@linkplain MediaItemConfig media items} until playback ends, seeks to {@code
+   * seekTimeMs}, resumes playback until it ends, and returns the timestamps of the processed
+   * frames, in microsecond.
+   */
+  private ImmutableList<Long> playSequenceUntilEndedAndSeekAndGetTimestampsUs(
+      List<MediaItemConfig> mediaItems, long seekTimeMs)
+      throws PlaybackException, TimeoutException {
+    InputTimestampRecordingShaderProgram inputTimestampRecordingShaderProgram =
+        new InputTimestampRecordingShaderProgram();
+    CountDownLatch videoGraphEnded = new CountDownLatch(1);
+    AtomicReference<@NullableType PlaybackException> playbackException = new AtomicReference<>();
+
+    List<EditedMediaItem> editedMediaItems = new ArrayList<>();
+    for (int i = 0; i < mediaItems.size(); i++) {
+      editedMediaItems.add(
+          createEditedMediaItem(
+              mediaItems.get(i),
+              /* videoEffect= */ (GlEffect)
+                  (context, useHdr) -> inputTimestampRecordingShaderProgram));
+    }
+
+    getInstrumentation()
+        .runOnMainSync(
+            () -> {
+              compositionPlayer =
+                  new CompositionPlayer.Builder(applicationContext)
+                      .setPreviewingVideoGraphFactory(
+                          new ListenerCapturingVideoGraphFactory(videoGraphEnded))
+                      .build();
+              // Set a surface on the player even though there is no UI on this test. We need a
+              // surface otherwise the player will skip/drop video frames.
+              compositionPlayer.setVideoSurfaceView(surfaceView);
+              compositionPlayer.addListener(playerTestListener);
+              compositionPlayer.addListener(
+                  new Player.Listener() {
+                    @Override
+                    public void onPlayerError(PlaybackException error) {
+                      playbackException.set(error);
+                    }
+                  });
+              compositionPlayer.setComposition(
+                  new Composition.Builder(
+                          new EditedMediaItemSequence.Builder(editedMediaItems).build())
+                      .build());
+              compositionPlayer.prepare();
+              compositionPlayer.play();
+            });
+    playerTestListener.waitUntilPlayerEnded();
+    playerTestListener.resetStatus();
+    getInstrumentation().runOnMainSync(() -> compositionPlayer.seekTo(seekTimeMs));
+    playerTestListener.waitUntilPlayerEnded();
+
     return inputTimestampRecordingShaderProgram.getInputTimestampsUs();
   }
 
@@ -713,26 +1024,14 @@ public class CompositionPlayerSeekTest {
   /**
    * Returns a list of {@linkplain EditedMediaItem EditedMediaItems}.
    *
-   * @param mediaItems The {@linkplain MediaItem MediaItems} that should be wrapped.
-   * @param durationsUs The durations of the {@linkplain EditedMediaItem EditedMediaItems}, in
-   *     microseconds.
+   * @param mediaItemConfig The {@link MediaItemConfig}.
    * @param videoEffect The {@link Effect} to apply to each {@link EditedMediaItem}.
    * @return A list of {@linkplain EditedMediaItem EditedMediaItems}.
    */
-  private static List<EditedMediaItem> createEditedMediaItems(
-      List<MediaItem> mediaItems, List<Long> durationsUs, Effect videoEffect) {
-    List<EditedMediaItem> editedMediaItems = new ArrayList<>();
-    for (int i = 0; i < mediaItems.size(); i++) {
-      editedMediaItems.add(
-          createEditedMediaItem(mediaItems.get(i), durationsUs.get(i), videoEffect));
-    }
-    return editedMediaItems;
-  }
-
   private static EditedMediaItem createEditedMediaItem(
-      MediaItem mediaItem, long durationUs, Effect videoEffect) {
-    return new EditedMediaItem.Builder(mediaItem)
-        .setDurationUs(durationUs)
+      MediaItemConfig mediaItemConfig, Effect videoEffect) {
+    return new EditedMediaItem.Builder(mediaItemConfig.mediaItem)
+        .setDurationUs(mediaItemConfig.durationUs)
         .setEffects(
             new Effects(/* audioProcessors= */ ImmutableList.of(), ImmutableList.of(videoEffect)))
         .build();
@@ -804,6 +1103,7 @@ public class CompositionPlayerSeekTest {
   }
 
   private static final class ResettableCountDownLatch {
+
     private CountDownLatch latch;
 
     public ResettableCountDownLatch(int count) {
@@ -830,6 +1130,17 @@ public class CompositionPlayerSeekTest {
 
     public void reset(int count) {
       latch = new CountDownLatch(count);
+    }
+  }
+
+  private static final class MediaItemConfig {
+
+    public final MediaItem mediaItem;
+    public final long durationUs;
+
+    public MediaItemConfig(MediaItem mediaItem, long durationUs) {
+      this.mediaItem = mediaItem;
+      this.durationUs = durationUs;
     }
   }
 }

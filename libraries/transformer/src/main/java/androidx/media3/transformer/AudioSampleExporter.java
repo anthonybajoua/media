@@ -87,7 +87,7 @@ import org.checkerframework.dataflow.qual.Pure;
             .setCodecs(firstInputFormat.codecs)
             .build();
 
-    // TODO - b/324426022: Move logic for supported mime types to DefaultEncoderFactory.
+    // TODO: b/324426022 - Move logic for supported mime types to DefaultEncoderFactory.
     encoder =
         encoderFactory.createForAudioEncoding(
             requestedEncoderFormat
@@ -98,7 +98,7 @@ import org.checkerframework.dataflow.qual.Pure;
                         muxerWrapper.getSupportedSampleMimeTypes(C.TRACK_TYPE_AUDIO)))
                 .build());
 
-    AudioFormat actualEncoderAudioFormat = new AudioFormat(encoder.getConfigurationFormat());
+    AudioFormat actualEncoderAudioFormat = new AudioFormat(encoder.getInputFormat());
     // This occurs when the encoder does not support the requested format. In this case, the audio
     // graph output needs to be resampled to a sample rate matching the encoder input to avoid
     // distorted audio.
@@ -222,7 +222,7 @@ import org.checkerframework.dataflow.qual.Pure;
   @Pure
   private static TransformationRequest createFallbackTransformationRequest(
       TransformationRequest transformationRequest, Format requestedFormat, Format actualFormat) {
-    // TODO(b/255953153): Consider including bitrate and other audio characteristics in the revised
+    // TODO: b/255953153 - Consider including bitrate and other audio characteristics in the revised
     //  fallback.
     if (Util.areEqual(requestedFormat.sampleMimeType, actualFormat.sampleMimeType)) {
       return transformationRequest;

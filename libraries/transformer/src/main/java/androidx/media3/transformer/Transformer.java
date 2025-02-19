@@ -122,6 +122,8 @@ public final class Transformer {
     private Looper looper;
     private DebugViewProvider debugViewProvider;
     private Clock clock;
+    private EditingMetricsCollector.MetricsReporter.@MonotonicNonNull Factory
+        metricsReporterFactory;
 
     /**
      * Creates a builder with default values.
@@ -142,6 +144,10 @@ public final class Transformer {
       debugViewProvider = DebugViewProvider.NONE;
       clock = Clock.DEFAULT;
       listeners = new ListenerSet<>(looper, clock, (listener, flags) -> {});
+      if (SDK_INT >= 35) {
+        metricsReporterFactory =
+            new EditingMetricsCollector.DefaultMetricsReporter.Factory(context);
+      }
     }
 
     /** Creates a builder with the values of the provided {@link Transformer}. */
@@ -169,6 +175,7 @@ public final class Transformer {
       this.looper = transformer.looper;
       this.debugViewProvider = transformer.debugViewProvider;
       this.clock = transformer.clock;
+      this.metricsReporterFactory = transformer.metricsReporterFactory;
     }
 
     /**
@@ -516,6 +523,23 @@ public final class Transformer {
     }
 
     /**
+     * Sets the {@link EditingMetricsCollector.MetricsReporter.Factory} that will be used to report
+     * the metrics.
+     *
+     * <p>The default value is {@link EditingMetricsCollector.DefaultMetricsReporter.Factory}.
+     *
+     * @param metricsReporterFactory A {@link EditingMetricsCollector.MetricsReporter.Factory}.
+     * @return This builder.
+     */
+    @CanIgnoreReturnValue
+    @VisibleForTesting
+    /* package */ Builder setMetricsReporterFactory(
+        EditingMetricsCollector.MetricsReporter.Factory metricsReporterFactory) {
+      this.metricsReporterFactory = metricsReporterFactory;
+      return this;
+    }
+
+    /**
      * Sets whether transformer reports diagnostics data to the Android platform.
      *
      * <p>If enabled, transformer will use the {@link android.media.metrics.MediaMetricsManager} to
@@ -526,8 +550,8 @@ public final class Transformer {
      * data is enabled</a> by the user of the device.
      *
      * @param usePlatformDiagnostics Whether transformer reports diagnostics data to the Android
-     *     platform
-     * @return This builder
+     *     platform.
+     * @return This builder.
      */
     @CanIgnoreReturnValue
     public Builder setUsePlatformDiagnostics(boolean usePlatformDiagnostics) {
@@ -582,7 +606,8 @@ public final class Transformer {
           muxerFactory,
           looper,
           debugViewProvider,
-          clock);
+          clock,
+          metricsReporterFactory);
     }
 
     private void checkSampleMimeType(String sampleMimeType) {
@@ -745,6 +770,8 @@ public final class Transformer {
 
   private static final int TRANSFORMER_STATE_PROCESS_MEDIA_START = 5;
   private static final int TRANSFORMER_STATE_REMUX_REMAINING_MEDIA = 6;
+  private static final String EXPORTER_NAME =
+      "androidx.media3.media3-transformer:" + MediaLibraryInfo.VERSION;
   private final Context context;
   private final TransformationRequest transformationRequest;
   private final ImmutableList<AudioProcessor> audioProcessors;
@@ -770,7 +797,7 @@ public final class Transformer {
   private final HandlerWrapper applicationHandler;
   private final ComponentListener componentListener;
   private final ExportResult.Builder exportResultBuilder;
-  private @MonotonicNonNull EditingMetricsCollector editingMetricsCollector;
+  @Nullable private final EditingMetricsCollector.MetricsReporter.Factory metricsReporterFactory;
 
   @Nullable private TransformerInternal transformerInternal;
   @Nullable private MuxerWrapper remuxingMuxerWrapper;
@@ -781,6 +808,7 @@ public final class Transformer {
   private TransmuxTranscodeHelper.@MonotonicNonNull ResumeMetadata resumeMetadata;
   private @MonotonicNonNull ListenableFuture<TransmuxTranscodeHelper.ResumeMetadata>
       getResumeMetadataFuture;
+  private @MonotonicNonNull EditingMetricsCollector editingMetricsCollector;
   private @MonotonicNonNull ListenableFuture<Void> copyOutputFuture;
   @Nullable private Mp4Info mediaItemInfo;
   @Nullable private WatchdogTimer exportWatchdogTimer;
@@ -806,7 +834,8 @@ public final class Transformer {
       Muxer.Factory muxerFactory,
       Looper looper,
       DebugViewProvider debugViewProvider,
-      Clock clock) {
+      Clock clock,
+      @Nullable EditingMetricsCollector.MetricsReporter.Factory metricsReporterFactory) {
     checkState(!removeAudio || !removeVideo, "Audio and video cannot both be removed.");
     this.context = context;
     this.transformationRequest = transformationRequest;
@@ -829,6 +858,7 @@ public final class Transformer {
     this.looper = looper;
     this.debugViewProvider = debugViewProvider;
     this.clock = clock;
+    this.metricsReporterFactory = metricsReporterFactory;
     transformerState = TRANSFORMER_STATE_PROCESS_FULL_INPUT;
     applicationHandler = clock.createHandler(looper, /* callback= */ null);
     componentListener = new ComponentListener();
@@ -1578,7 +1608,17 @@ public final class Transformer {
     }
     DebugTraceUtil.reset();
     if (canCollectEditingMetrics()) {
-      editingMetricsCollector = new EditingMetricsCollector(context);
+      @Nullable String muxerName = null;
+      if (muxerFactory instanceof InAppMp4Muxer.Factory) {
+        muxerName = InAppMp4Muxer.MUXER_NAME;
+      } else if (muxerFactory instanceof InAppFragmentedMp4Muxer.Factory) {
+        muxerName = InAppFragmentedMp4Muxer.MUXER_NAME;
+      } else if (muxerFactory instanceof DefaultMuxer.Factory) {
+        muxerName = DefaultMuxer.MUXER_NAME;
+      }
+      editingMetricsCollector =
+          new EditingMetricsCollector(
+              checkNotNull(metricsReporterFactory).create(), EXPORTER_NAME, muxerName);
     }
     transformerInternal =
         new TransformerInternal(
@@ -1609,7 +1649,7 @@ public final class Transformer {
         listener -> listener.onCompleted(checkNotNull(composition), exportResult));
     listeners.flushEvents();
     if (canCollectEditingMetrics()) {
-      checkNotNull(editingMetricsCollector).onExportSuccess(exportResult.processedInputs);
+      checkNotNull(editingMetricsCollector).onExportSuccess(exportResult);
     }
     transformerState = TRANSFORMER_STATE_PROCESS_FULL_INPUT;
   }
@@ -1629,7 +1669,7 @@ public final class Transformer {
               ? progressHolder.progress
               : C.PERCENTAGE_UNSET;
       checkNotNull(editingMetricsCollector)
-          .onExportError(progressPercentage, exception, exportResult.processedInputs);
+          .onExportError(progressPercentage, exception, exportResult);
     }
     transformerState = TRANSFORMER_STATE_PROCESS_FULL_INPUT;
   }
@@ -1655,7 +1695,7 @@ public final class Transformer {
         exportResultBuilder.setVideoEncoderName(videoEncoderName);
       }
 
-      // TODO(b/213341814): Add event flags for Transformer events.
+      // TODO: b/213341814 - Add event flags for Transformer events.
       transformerInternal = null;
       if (transformerState == TRANSFORMER_STATE_REMUX_PROCESSED_VIDEO) {
         processRemainingVideo();

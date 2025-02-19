@@ -141,6 +141,11 @@ public final class DefaultVideoFrameProcessor implements VideoFrameProcessor {
    */
   public static final int WORKING_COLOR_SPACE_LINEAR = 2;
 
+  // LINT.ThenChange(
+  // ../../../../../../../effect/src/main/assets/shaders/fragment_shader_transformation_sdr_external_es2.glsl:working_color_space,
+  // ../../../../../../../effect/src/main/assets/shaders/fragment_shader_transformation_sdr_internal_es2.glsl:working_color_space,
+  // )
+
   /** A factory for {@link DefaultVideoFrameProcessor} instances. */
   public static final class Factory implements VideoFrameProcessor.Factory {
     private static final String THREAD_NAME = "Effect:DefaultVideoFrameProcessor:GlThread";
@@ -230,6 +235,10 @@ public final class DefaultVideoFrameProcessor implements VideoFrameProcessor {
        * Sets the {@link GlObjectsProvider}.
        *
        * <p>The default value is a {@link DefaultGlObjectsProvider}.
+       *
+       * <p>If both the {@link GlObjectsProvider} and the {@link ExecutorService} are set, it's the
+       * caller's responsibility to release the {@link GlObjectsProvider} on the {@link
+       * ExecutorService}'s thread.
        */
       @CanIgnoreReturnValue
       public Builder setGlObjectsProvider(GlObjectsProvider glObjectsProvider) {
@@ -403,16 +412,16 @@ public final class DefaultVideoFrameProcessor implements VideoFrameProcessor {
         throws VideoFrameProcessingException {
       // TODO(b/261188041) Add tests to verify the Listener is invoked on the given Executor.
 
-      boolean shouldShutdownExecutorService = executorService == null;
       ExecutorService instanceExecutorService =
           executorService == null ? Util.newSingleThreadExecutor(THREAD_NAME) : executorService;
-
+      boolean shouldShutdownExecutorService = executorService == null;
       VideoFrameProcessingTaskExecutor videoFrameProcessingTaskExecutor =
           new VideoFrameProcessingTaskExecutor(
               instanceExecutorService, shouldShutdownExecutorService, listener::onError);
 
-      GlObjectsProvider glObjectsProvider =
-          this.glObjectsProvider == null ? new DefaultGlObjectsProvider() : this.glObjectsProvider;
+      boolean shouldReleaseGlObjectsProvider = glObjectsProvider == null || executorService == null;
+      GlObjectsProvider instanceGlObjectsProvider =
+          glObjectsProvider == null ? new DefaultGlObjectsProvider() : glObjectsProvider;
 
       Future<DefaultVideoFrameProcessor> defaultVideoFrameProcessorFuture =
           instanceExecutorService.submit(
@@ -426,7 +435,8 @@ public final class DefaultVideoFrameProcessor implements VideoFrameProcessor {
                       videoFrameProcessingTaskExecutor,
                       listenerExecutor,
                       listener,
-                      glObjectsProvider,
+                      instanceGlObjectsProvider,
+                      shouldReleaseGlObjectsProvider,
                       textureOutputListener,
                       textureOutputCapacity,
                       repeatLastRegisteredFrame,
@@ -448,6 +458,7 @@ public final class DefaultVideoFrameProcessor implements VideoFrameProcessor {
 
   private final Context context;
   private final GlObjectsProvider glObjectsProvider;
+  private final boolean shouldReleaseGlObjectsProvider;
   private final EGLDisplay eglDisplay;
   private final InputSwitcher inputSwitcher;
   private final VideoFrameProcessingTaskExecutor videoFrameProcessingTaskExecutor;
@@ -480,6 +491,7 @@ public final class DefaultVideoFrameProcessor implements VideoFrameProcessor {
   private final List<Effect> activeEffects;
   private final Object lock;
   private final ColorInfo outputColorInfo;
+  private final DebugViewProvider debugViewProvider;
 
   private volatile @MonotonicNonNull FrameInfo nextInputFrameInfo;
   private volatile boolean inputStreamEnded;
@@ -487,6 +499,7 @@ public final class DefaultVideoFrameProcessor implements VideoFrameProcessor {
   private DefaultVideoFrameProcessor(
       Context context,
       GlObjectsProvider glObjectsProvider,
+      boolean shouldReleaseGlObjectsProvider,
       EGLDisplay eglDisplay,
       InputSwitcher inputSwitcher,
       VideoFrameProcessingTaskExecutor videoFrameProcessingTaskExecutor,
@@ -494,9 +507,11 @@ public final class DefaultVideoFrameProcessor implements VideoFrameProcessor {
       Executor listenerExecutor,
       FinalShaderProgramWrapper finalShaderProgramWrapper,
       boolean renderFramesAutomatically,
-      ColorInfo outputColorInfo) {
+      ColorInfo outputColorInfo,
+      DebugViewProvider debugViewProvider) {
     this.context = context;
     this.glObjectsProvider = glObjectsProvider;
+    this.shouldReleaseGlObjectsProvider = shouldReleaseGlObjectsProvider;
     this.eglDisplay = eglDisplay;
     this.inputSwitcher = inputSwitcher;
     this.videoFrameProcessingTaskExecutor = videoFrameProcessingTaskExecutor;
@@ -506,6 +521,7 @@ public final class DefaultVideoFrameProcessor implements VideoFrameProcessor {
     this.activeEffects = new ArrayList<>();
     this.lock = new Object();
     this.outputColorInfo = outputColorInfo;
+    this.debugViewProvider = debugViewProvider;
     this.finalShaderProgramWrapper = finalShaderProgramWrapper;
     this.intermediateGlShaderPrograms = new ArrayList<>();
     this.inputStreamRegisteredCondition = new ConditionVariable();
@@ -825,6 +841,7 @@ public final class DefaultVideoFrameProcessor implements VideoFrameProcessor {
       Executor videoFrameProcessorListenerExecutor,
       Listener listener,
       GlObjectsProvider glObjectsProvider,
+      boolean shouldReleaseGlObjectsProvider,
       @Nullable GlTextureProducer.Listener textureOutputListener,
       int textureOutputCapacity,
       boolean repeatLastRegisteredFrame,
@@ -870,7 +887,6 @@ public final class DefaultVideoFrameProcessor implements VideoFrameProcessor {
             eglDisplay,
             eglContextAndPlaceholderSurface.first,
             eglContextAndPlaceholderSurface.second,
-            debugViewProvider,
             outputColorInfo,
             videoFrameProcessingTaskExecutor,
             videoFrameProcessorListenerExecutor,
@@ -883,6 +899,7 @@ public final class DefaultVideoFrameProcessor implements VideoFrameProcessor {
     return new DefaultVideoFrameProcessor(
         context,
         glObjectsProvider,
+        shouldReleaseGlObjectsProvider,
         eglDisplay,
         inputSwitcher,
         videoFrameProcessingTaskExecutor,
@@ -890,7 +907,8 @@ public final class DefaultVideoFrameProcessor implements VideoFrameProcessor {
         videoFrameProcessorListenerExecutor,
         finalShaderProgramWrapper,
         renderFramesAutomatically,
-        outputColorInfo);
+        outputColorInfo,
+        debugViewProvider);
   }
 
   /**
@@ -935,10 +953,10 @@ public final class DefaultVideoFrameProcessor implements VideoFrameProcessor {
         rgbMatrixListBuilder.add((RgbMatrix) glEffect);
         continue;
       }
+      boolean isOutputTransferHdr = ColorInfo.isTransferHdr(outputColorInfo);
       ImmutableList<GlMatrixTransformation> matrixTransformations =
           matrixTransformationListBuilder.build();
       ImmutableList<RgbMatrix> rgbMatrices = rgbMatrixListBuilder.build();
-      boolean isOutputTransferHdr = ColorInfo.isTransferHdr(outputColorInfo);
       if (!matrixTransformations.isEmpty() || !rgbMatrices.isEmpty()) {
         DefaultShaderProgram defaultShaderProgram =
             DefaultShaderProgram.create(
@@ -1019,11 +1037,16 @@ public final class DefaultVideoFrameProcessor implements VideoFrameProcessor {
         intermediateGlShaderPrograms.clear();
       }
 
+      ImmutableList.Builder<Effect> effectsListBuilder =
+          new ImmutableList.Builder<Effect>().addAll(inputStreamInfo.effects);
+      if (debugViewProvider != DebugViewProvider.NONE) {
+        effectsListBuilder.add(new DebugViewEffect(debugViewProvider, outputColorInfo));
+      }
       // The GlShaderPrograms that should be inserted in between InputSwitcher and
       // FinalShaderProgramWrapper.
       intermediateGlShaderPrograms.addAll(
           createGlShaderPrograms(
-              context, inputStreamInfo.effects, outputColorInfo, finalShaderProgramWrapper));
+              context, effectsListBuilder.build(), outputColorInfo, finalShaderProgramWrapper));
       inputSwitcher.setDownstreamShaderProgram(
           getFirst(intermediateGlShaderPrograms, /* defaultValue= */ finalShaderProgramWrapper));
       chainShaderProgramsWithListeners(
@@ -1126,10 +1149,12 @@ public final class DefaultVideoFrameProcessor implements VideoFrameProcessor {
         Log.e(TAG, "Error releasing shader program", e);
       }
     } finally {
-      try {
-        glObjectsProvider.release(eglDisplay);
-      } catch (GlUtil.GlException e) {
-        Log.e(TAG, "Error releasing GL objects", e);
+      if (shouldReleaseGlObjectsProvider) {
+        try {
+          glObjectsProvider.release(eglDisplay);
+        } catch (GlUtil.GlException e) {
+          Log.e(TAG, "Error releasing GL objects", e);
+        }
       }
     }
   }

@@ -50,6 +50,7 @@ import androidx.media3.common.VideoSize;
 import androidx.media3.common.text.CueGroup;
 import androidx.media3.common.util.Log;
 import androidx.media3.common.util.Size;
+import androidx.media3.common.util.Util;
 import androidx.media3.session.legacy.MediaSessionCompat;
 import androidx.media3.session.legacy.PlaybackStateCompat;
 import androidx.media3.session.legacy.VolumeProviderCompat;
@@ -1084,13 +1085,16 @@ import java.util.List;
           .build();
     }
     @Nullable PlaybackException playerError = getPlayerError();
+    boolean shouldShowPlayButton = Util.shouldShowPlayButton(/* player= */ this, playIfSuppressed);
     int state =
-        LegacyConversions.convertToPlaybackStateCompatState(/* player= */ this, playIfSuppressed);
+        LegacyConversions.convertToPlaybackStateCompatState(
+            /* player= */ this, shouldShowPlayButton);
     // Always advertise ACTION_SET_RATING.
     long actions = PlaybackStateCompat.ACTION_SET_RATING;
     Commands availableCommands = intersect(availablePlayerCommands, getAvailableCommands());
     for (int i = 0; i < availableCommands.size(); i++) {
-      actions |= convertCommandToPlaybackStateActions(availableCommands.get(i));
+      actions |=
+          convertCommandToPlaybackStateActions(availableCommands.get(i), shouldShowPlayButton);
     }
     if (!mediaButtonPreferences.isEmpty()
         && !legacyExtras.getBoolean(MediaConstants.EXTRAS_KEY_SLOT_RESERVATION_SEEK_TO_PREV)) {
@@ -1346,12 +1350,13 @@ import java.util.List;
   }
 
   @SuppressWarnings("deprecation") // Uses deprecated PlaybackStateCompat actions.
-  private static long convertCommandToPlaybackStateActions(@Command int command) {
+  private static long convertCommandToPlaybackStateActions(
+      @Command int command, boolean shouldShowPlayButton) {
     switch (command) {
       case Player.COMMAND_PLAY_PAUSE:
-        return PlaybackStateCompat.ACTION_PAUSE
-            | PlaybackStateCompat.ACTION_PLAY
-            | PlaybackStateCompat.ACTION_PLAY_PAUSE;
+        return shouldShowPlayButton
+            ? PlaybackStateCompat.ACTION_PLAY | PlaybackStateCompat.ACTION_PLAY_PAUSE
+            : PlaybackStateCompat.ACTION_PAUSE | PlaybackStateCompat.ACTION_PLAY_PAUSE;
       case Player.COMMAND_PREPARE:
         return PlaybackStateCompat.ACTION_PREPARE;
       case Player.COMMAND_SEEK_BACK:
@@ -1415,6 +1420,7 @@ import java.util.List;
     @Nullable private final MediaItem mediaItem;
     private final boolean isSeekable;
     private final boolean isDynamic;
+    private final boolean isPlaceholder;
     @Nullable private final MediaItem.LiveConfiguration liveConfiguration;
     private final long durationUs;
 
@@ -1422,6 +1428,13 @@ import java.util.List;
       mediaItem = player.getCurrentMediaItem();
       isSeekable = player.isCurrentMediaItemSeekable();
       isDynamic = player.isCurrentMediaItemDynamic();
+      Timeline timeline = player.getCurrentTimeline();
+      isPlaceholder =
+          !timeline.isEmpty()
+              && player
+                  .getCurrentTimeline()
+                  .getWindow(player.getCurrentMediaItemIndex(), new Window())
+                  .isPlaceholder;
       liveConfiguration =
           player.isCurrentMediaItemLive() ? MediaItem.LiveConfiguration.UNSET : null;
       durationUs = msToUs(player.getContentDuration());
@@ -1449,6 +1462,7 @@ import java.util.List;
           /* firstPeriodIndex= */ 0,
           /* lastPeriodIndex= */ 0,
           /* positionInFirstPeriodUs= */ 0);
+      window.isPlaceholder = isPlaceholder;
       return window;
     }
 
@@ -1465,6 +1479,7 @@ import java.util.List;
           /* windowIndex= */ 0,
           durationUs,
           /* positionInWindowUs= */ 0);
+      period.isPlaceholder = isPlaceholder;
       return period;
     }
 

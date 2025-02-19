@@ -26,6 +26,7 @@ import static androidx.media3.transformer.AndroidTestUtil.PNG_ASSET;
 import static androidx.test.platform.app.InstrumentationRegistry.getInstrumentation;
 import static com.google.common.truth.Truth.assertThat;
 import static java.util.concurrent.TimeUnit.MILLISECONDS;
+import static org.junit.Assume.assumeFalse;
 
 import android.content.Context;
 import androidx.media3.common.Effect;
@@ -209,6 +210,9 @@ public class CompositionPlaybackTest {
 
   @Test
   public void playback_sequenceOfImageAndVideo_effectsReceiveCorrectTimestamps() throws Exception {
+    // The MediaCodec decoder's output surface is sometimes dropping frames on emulator despite
+    // using MediaFormat.KEY_ALLOW_FRAME_DROP.
+    assumeFalse("Skipped on emulator due to surface dropping frames", isRunningOnEmulator());
     InputTimestampRecordingShaderProgram inputTimestampRecordingShaderProgram =
         new InputTimestampRecordingShaderProgram();
     Effect videoEffect = (GlEffect) (context, useHdr) -> inputTimestampRecordingShaderProgram;
@@ -463,12 +467,57 @@ public class CompositionPlaybackTest {
     playerTestListener.waitUntilPlayerEnded();
   }
 
+  @Test
+  public void playback_sequenceOfVideosWithPrewarmingDisabled_effectsReceiveCorrectTimestamps()
+      throws Exception {
+    InputTimestampRecordingShaderProgram inputTimestampRecordingShaderProgram =
+        new InputTimestampRecordingShaderProgram();
+    Effect videoEffect = (GlEffect) (context, useHdr) -> inputTimestampRecordingShaderProgram;
+    EditedMediaItem editedMediaItem =
+        new EditedMediaItem.Builder(VIDEO_MEDIA_ITEM)
+            .setDurationUs(VIDEO_DURATION_US)
+            .setEffects(
+                new Effects(
+                    /* audioProcessors= */ ImmutableList.of(),
+                    /* videoEffects= */ ImmutableList.of(videoEffect)))
+            .build();
+    Composition composition =
+        new Composition.Builder(
+                new EditedMediaItemSequence.Builder(
+                        editedMediaItem, editedMediaItem, editedMediaItem)
+                    .build())
+            .build();
+    ImmutableList<Long> expectedTimestampsUs =
+        new ImmutableList.Builder<Long>()
+            .addAll(VIDEO_TIMESTAMPS_US)
+            .addAll(
+                Iterables.transform(
+                    VIDEO_TIMESTAMPS_US, timestampUs -> (VIDEO_DURATION_US + timestampUs)))
+            .addAll(
+                Iterables.transform(
+                    VIDEO_TIMESTAMPS_US, timestampUs -> (2 * VIDEO_DURATION_US + timestampUs)))
+            .build();
+
+    runCompositionPlayer(composition, /* videoPrewarmingEnabled= */ false);
+
+    assertThat(inputTimestampRecordingShaderProgram.getInputTimestampsUs())
+        .isEqualTo(expectedTimestampsUs);
+  }
+
   private void runCompositionPlayer(Composition composition)
+      throws PlaybackException, TimeoutException {
+    runCompositionPlayer(composition, /* videoPrewarmingEnabled= */ true);
+  }
+
+  private void runCompositionPlayer(Composition composition, boolean videoPrewarmingEnabled)
       throws PlaybackException, TimeoutException {
     getInstrumentation()
         .runOnMainSync(
             () -> {
-              player = new CompositionPlayer.Builder(context).build();
+              player =
+                  new CompositionPlayer.Builder(context)
+                      .setVideoPrewarmingEnabled(videoPrewarmingEnabled)
+                      .build();
               player.addListener(playerTestListener);
               player.setComposition(composition);
               player.prepare();
