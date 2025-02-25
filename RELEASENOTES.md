@@ -7,6 +7,9 @@
         it easier to handle updates in other classes
         ([#2128](https://github.com/androidx/media/issues/2128)).
 *   ExoPlayer:
+    *   Fix a bug where `ExoPlayer.isLoading()` remains `true` while it has
+        transitioned to `STATE_IDLE` or `STATE_ENDED`
+        ([#2133](https://github.com/androidx/media/issues/2133)).
 *   Transformer:
 *   Track Selection:
 *   Extractors:
@@ -20,12 +23,25 @@
 *   DRM:
 *   Effect:
 *   Muxers:
+    *   `writeSampleData()` API now uses muxer specific `BufferInfo` class
+        instead of `MediaCodec.BufferInfo`.
 *   IMA extension:
 *   Session:
     *   Make `MediaSession.setSessionActivity(PendingIntent)` accept null
         ([#2109](https://github.com/androidx/media/issues/2109)).
 *   UI:
 *   Downloads:
+    *   Fix bug in `CacheWriter` that leaves data sources open and cache areas
+        locked in case the data source throws an `Exception` other than
+        `IOException`
+        ([#9760](https://github.com/google/ExoPlayer/issues/9760)).
+    *   Add partial download support for progressive streams. Apps can prepare a
+        progressive stream with `DownloadHelper`, and request a
+        `DownloadRequest` from the helper with specifying the time-based media
+        start and end positions that the download should cover. The returned
+        `DownloadRequest` carries the resolved byte range, with which a
+        `ProgressiveDownloader` can be created and download the content
+        correspondingly.
 *   OkHttp Extension:
 *   Cronet Extension:
 *   RTMP Extension:

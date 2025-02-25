@@ -795,7 +795,7 @@ public final class Util {
     if (!looper.getThread().isAlive()) {
       return false;
     }
-    if (handler.getLooper() == Looper.myLooper()) {
+    if (looper == Looper.myLooper()) {
       runnable.run();
       return true;
     } else {
@@ -3476,6 +3476,20 @@ public final class Util {
     } catch (NumberFormatException e) {
       return 0;
     }
+  }
+
+  /** Returns {@link C.BufferFlags} corresponding to {@link MediaCodec} flags. */
+  @UnstableApi
+  public static @C.BufferFlags int getBufferFlagsFromMediaCodecFlags(int mediaCodecFlags) {
+    @C.BufferFlags int flags = 0;
+    if ((mediaCodecFlags & MediaCodec.BUFFER_FLAG_KEY_FRAME) == MediaCodec.BUFFER_FLAG_KEY_FRAME) {
+      flags |= C.BUFFER_FLAG_KEY_FRAME;
+    }
+    if ((mediaCodecFlags & MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+        == MediaCodec.BUFFER_FLAG_END_OF_STREAM) {
+      flags |= C.BUFFER_FLAG_END_OF_STREAM;
+    }
+    return flags;
   }
 
   @UnstableApi
