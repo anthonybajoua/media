@@ -3475,9 +3475,9 @@ public abstract class SimpleBasePlayer extends BasePlayer {
    * <p>Will only be called if {@link Player#COMMAND_CHANGE_MEDIA_ITEMS} is available.
    *
    * @param fromIndex The start index of the items to replace. The index is in the range 0 &lt;=
-   *     {@code fromIndex} &lt; {@link #getMediaItemCount()}.
+   *     {@code fromIndex} &lt;= {@link #getMediaItemCount()}.
    * @param toIndex The index of the first item not to be replaced (exclusive). The index is in the
-   *     range {@code fromIndex} &lt; {@code toIndex} &lt;= {@link #getMediaItemCount()}.
+   *     range {@code fromIndex} &lt;= {@code toIndex} &lt;= {@link #getMediaItemCount()}.
    * @param mediaItems The media items to replace the specified range with.
    * @return A {@link ListenableFuture} indicating the completion of all immediate {@link State}
    *     changes caused by this call.
@@ -3486,6 +3486,9 @@ public abstract class SimpleBasePlayer extends BasePlayer {
   protected ListenableFuture<?> handleReplaceMediaItems(
       int fromIndex, int toIndex, List<MediaItem> mediaItems) {
     ListenableFuture<?> addFuture = handleAddMediaItems(toIndex, mediaItems);
+    if (fromIndex == toIndex) {
+      return addFuture;
+    }
     ListenableFuture<?> removeFuture = handleRemoveMediaItems(fromIndex, toIndex);
     return Util.transformFutureAsync(addFuture, unused -> removeFuture);
   }
